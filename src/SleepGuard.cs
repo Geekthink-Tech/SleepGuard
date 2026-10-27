@@ -1,9 +1,9 @@
 // SleepGuard - "phantom-input aware" idle watchdog for Windows.
 //
-// Purpose: some USB HID devices (a water-cooling LCD controller, a vendor
-// dashboard, a macro pad, ...) send input reports several times per second.
-// Windows counts those as user activity, so GetLastInputInfo() never reaches
-// the display-off / sleep timeouts and the monitor stays on forever.
+// Purpose: some USB HID devices (e.g. a water-block LCD screen driven by HiMOS)
+// send input reports several times per second. Windows counts those as user
+// activity, so GetLastInputInfo() never reaches the display-off / sleep
+// timeouts and the monitor stays on forever.
 //
 // SleepGuard keeps its own "real input" clock: it only counts mouse, keyboard,
 // pen, touch and precision-touchpad raw input that does NOT come from the
@@ -70,6 +70,7 @@ internal static class SleepGuard
     private static IntPtr hibTimer = IntPtr.Zero;
 
     private static WndProcDelegate wndProcKeepAlive;
+    private static Mutex instanceMutex;   // rooted: keeps the singleton mutex alive
 
     // ---- P/Invoke --------------------------------------------------------
     [StructLayout(LayoutKind.Sequential)]
@@ -250,10 +251,19 @@ internal static class SleepGuard
         uint size = 0;
         GetRawInputDeviceInfoW(hDevice, RIDI_DEVICENAME, IntPtr.Zero, ref size);
         if (size == 0) return string.Empty;
-        IntPtr buf = Marshal.AllocHGlobal((int)size * 2);
+
+        // The size reported for RIDI_DEVICENAME may or may not include the
+        // terminating NUL depending on the driver, so the buffer gets extra
+        // slack and is zeroed. An exact-size allocation used to put a 2-byte
+        // terminator write past the block, which eventually corrupted the heap
+        // and crashed inside VCRUNTIME140_CLR0400.dll.
+        const int slack = 16;
+        int bytes = ((int)size + slack) * 2;
+        IntPtr buf = Marshal.AllocHGlobal(bytes);
         try
         {
-            uint chars = size;
+            for (int i = 0; i < bytes; i += 2) Marshal.WriteInt16(buf, i, 0);  // cheap, one-time per device
+            uint chars = (uint)size + slack;
             uint got = GetRawInputDeviceInfoW(hDevice, RIDI_DEVICENAME, buf, ref chars);
             if (got == 0) return string.Empty;
             string s = Marshal.PtrToStringUni(buf);
@@ -588,27 +598,71 @@ internal static class SleepGuard
         }
     }
 
+    // Raw-input device handle -> "is this the phantom HID?" verdict, plus the
+    // resolved name for logging. Filled lazily on first event per handle.
+    private static readonly System.Collections.Generic.Dictionary<IntPtr, bool> deviceIsPhantom =
+        new System.Collections.Generic.Dictionary<IntPtr, bool>();
+    private static readonly System.Collections.Generic.Dictionary<IntPtr, string> deviceNames =
+        new System.Collections.Generic.Dictionary<IntPtr, string>();
+
+    private static void OnRealInput(IntPtr hDevice)
+    {
+        lastRealMs = clock.ElapsedMilliseconds;
+        inputSinceSuspend = true;
+        displayPostponed = false;
+        CancelHibTimer();   // the user is here, do not hibernate on them
+        if (displayOff)
+        {
+            string dev;
+            if (!deviceNames.TryGetValue(hDevice, out dev)) dev = hDevice.ToString();
+            TryLog("real input detected (" + dev + ") -> display considered awake");
+            displayOff = false;
+        }
+    }
+
+    private static void TryLog(string message)
+    {
+        try { Log(message); } catch { }
+    }
+
     private static IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        // Any exception escaping a native callback would kill the process, so
+        // everything is contained here.
+        try
+        {
+            return WndProcCore(hWnd, msg, wParam, lParam);
+        }
+        catch (Exception ex)
+        {
+            TryLog("WndProc exception: " + ex);
+            return IntPtr.Zero;
+        }
+    }
+
+    private static IntPtr WndProcCore(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
         switch (msg)
         {
             case WM_INPUT:
             {
                 RAWINPUTHEADER hdr = (RAWINPUTHEADER)Marshal.PtrToStructure(lParam, typeof(RAWINPUTHEADER));
-                string dev = GetDeviceName(hdr.hDevice);
-                if (!IsPhantom(dev))
+                // Classify the device once per handle and cache the verdict: the
+                // phantom water-cooler HID fires ~3 events/s, so resolving the
+                // name on every single event would be wasteful (and it was the
+                // path that corrupted the heap).
+                bool phantom;
+                if (!deviceIsPhantom.TryGetValue(hdr.hDevice, out phantom))
                 {
-                    lastRealMs = clock.ElapsedMilliseconds;
-                    inputSinceSuspend = true;
-                    displayPostponed = false;
-                    CancelHibTimer();   // the user is here, do not hibernate on them
-                    if (displayOff)
-                    {
-                        Log("real input detected (" + dev + ") -> display considered awake");
-                        displayOff = false;
-                    }
+                    string name = GetDeviceName(hdr.hDevice);
+                    phantom = IsPhantom(name);
+                    deviceIsPhantom[hdr.hDevice] = phantom;
+                    if (!deviceNames.ContainsKey(hdr.hDevice)) deviceNames[hdr.hDevice] = name;
                 }
-                return IntPtr.Zero;
+                if (!phantom) OnRealInput(hdr.hDevice);
+                // Docs: WM_INPUT must reach DefWindowProc or the system never
+                // frees the raw-input buffer.
+                return DefWindowProcW(hWnd, msg, wParam, lParam);
             }
             case WM_TIMER:
                 OnTick();
@@ -676,8 +730,15 @@ internal static class SleepGuard
         // both mean COM is already usable and MTA is fine for MMDeviceEnumerator.
         CoInitializeEx(IntPtr.Zero, 0 /* COINIT_MULTITHREADED */);
 
+        // Keep a crash on record: an unhandled exception would otherwise leave
+        // only a WER entry behind.
+        AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+        {
+            TryLog("UNHANDLED EXCEPTION: " + e.ExceptionObject);
+        };
+
         bool isNew;
-        Mutex instance = new Mutex(true, "Local\\SleepGuard.Instance", out isNew);
+        instanceMutex = new Mutex(true, "Local\\SleepGuard.Instance", out isNew);
         if (!isNew)
         {
             Log("another SleepGuard instance is already running; exiting");
@@ -739,14 +800,16 @@ internal static class SleepGuard
         Log("ready: watching real input; phantom devices are ignored");
 
         MSG msg;
-        while (GetMessageW(out msg, IntPtr.Zero, 0, 0) != 0)
+        int gm;
+        while ((gm = GetMessageW(out msg, IntPtr.Zero, 0, 0)) > 0)
         {
             TranslateMessage(ref msg);
             DispatchMessageW(ref msg);
         }
+        if (gm == -1) TryLog("GetMessageW failed, err=" + Marshal.GetLastWin32Error());
 
         Log("message loop ended; exiting");
-        instance.ReleaseMutex();
+        if (instanceMutex != null) instanceMutex.ReleaseMutex();
         return 0;
     }
 }

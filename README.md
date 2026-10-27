@@ -162,6 +162,35 @@ handy to prove the problem exists before/after.
 - Suspend requires the process to run as administrator (`SeShutdownPrivilege`); monitor-off and
   counting work without it.
 
+## Stability notes (v1.0.1)
+
+v1.0.1 fixes a crash that showed up after ~5 minutes of normal use (the first version died silently,
+leaving you unprotected):
+
+- `GetRawInputDeviceInfo(RIDI_DEVICENAME)` can report a size that *excludes* the terminating NUL.
+  The buffer was allocated at exactly that size, so every raw-input event wrote two bytes past the
+  block. With a phantom HID firing ~3 events/s, the heap was corrupted within minutes and the
+  process died with `0xC0000005` inside `VCRUNTIME140_CLR0400.dll`.
+- Device-name resolution is now done once per device handle and cached, and `WM_INPUT` is forwarded
+  to `DefWindowProc` (required, otherwise the raw-input buffer is never freed).
+- Anything thrown inside the window procedure is caught and logged instead of killing the process,
+  and an `AppDomain.UnhandledException` hook records unexpected exceptions in the log.
+- The singleton mutex is kept in a static field so it cannot be collected early.
+
+If it ever dies again, check `Get-ScheduledTaskInfo SleepGuard` — `LastTaskResult` `3221225477`
+(`0xC0000005`) means an access violation; Event Viewer → Windows Logs → Application → "Application
+Error" names the faulting module. For a dump, enable local dumps once:
+
+```powershell
+$k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\SleepGuard.exe'
+New-Item $k -Force | Out-Null
+New-ItemProperty $k -Name DumpFolder -Value 'C:\ProgramData\SleepGuard\dumps' -PropertyType ExpandString -Force | Out-Null
+New-ItemProperty $k -Name DumpType   -Value 1 -PropertyType DWord -Force | Out-Null
+```
+
+The registered task restarts the binary up to 3 times at 1-minute intervals, so a crash does not
+leave the machine unprotected for long.
+
 ## Uninstall
 
 ```powershell
