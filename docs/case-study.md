@@ -124,3 +124,34 @@ Get-Content .\tools\quiet-probe-log.txt
 ```
 
 Then either uninstall, or use SleepGuard with `--phantom <that device name>`.
+
+## Postmortem: the first build crashed after ~5 minutes
+
+The first version passed its short tests (30-90 s) and then vanished mid-use. Task Scheduler said
+`LastTaskResult = 3221225477` (`0xC0000005`), Event Viewer said:
+
+```text
+出错应用程序名称： SleepGuard.exe
+出错模块名称： VCRUNTIME140_CLR0400.dll, 版本 14.32.31326.0
+异常代码： 0xc0000005    错误偏移： 0x0000000000001416
+```
+
+Cause: `GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, ...)` reports a size that can *exclude* the
+terminating NUL. The buffer was allocated at exactly `size * 2` bytes, so the API wrote two bytes
+past the block on **every** `WM_INPUT`. The phantom HID alone fires about 3 events per second, so the
+native heap was corrupted within minutes and the CLR's C runtime died on a later allocation/free.
+
+Fixes shipped in v1.0.1:
+
+- device-name buffer gets slack and is zeroed before the call;
+- device classification is resolved once per handle and cached (no per-event string marshalling);
+- `WM_INPUT` is forwarded to `DefWindowProc` so the raw-input buffer is released;
+- exceptions escaping the window procedure are caught and logged, `GetMessageW() == -1` is an error;
+- the singleton mutex is rooted in a static field;
+- scheduled task restarts on failure; local crash dumps documented in the README.
+
+Lessons:
+
+- A watchdog that dies silently is worse than no watchdog. Enable restart-on-failure and check
+  `Get-ScheduledTaskInfo` after the first hour of real use.
+- Exercise long-running P/Invoke code for minutes, not seconds, before trusting it.
