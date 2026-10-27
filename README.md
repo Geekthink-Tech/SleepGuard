@@ -54,7 +54,7 @@ podcast, screen would otherwise go black" exception.
 ## Quick start
 
 ```powershell
-git clone https://github.com/<you>/SleepGuard.git
+git clone https://github.com/arthur-aicoding/SleepGuard.git
 cd SleepGuard
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 
@@ -197,6 +197,24 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 **查日志**：`Get-Content "$env:LOCALAPPDATA\SleepGuard\sleep-guard.log" -Tail 30`
 
 **先诊断到底是谁在捣乱**：`.\tools\quiet-probe.ps1`（见上文），把抓到的设备名加进 `--phantom`。
+
+## CI
+
+`docs/ci-workflow.yml` is a ready-made GitHub Actions workflow: on a Windows runner it builds both
+binaries with the in-box compiler, runs a 4-second smoke test (`--display 0 --sleep 0`, so it never
+touches the display) and uploads the exes as an artifact.
+
+GitHub requires the `workflow` OAuth scope to push files under `.github/workflows/`, so the file is
+shipped as a template. To enable it:
+
+```powershell
+gh auth refresh -s workflow
+New-Item -ItemType Directory -Force .github\workflows | Out-Null
+Copy-Item docs\ci-workflow.yml .github\workflows\build.yml
+git add .github/workflows/build.yml
+git commit -m 'ci: add build workflow'
+git push
+```
 
 ## License
 
