@@ -65,6 +65,8 @@ internal static class SleepGuard
     private static long lastRealMs;
     private static bool displayOff;
     private static bool displayPostponed;   // audio/video is playing -> display-off deferred
+    private static long lastAudioMs;        // wall ms of the last tick that saw real audio
+    private const int AudioGraceMs = 10000; // keep the display on this long after the last sound
     private static long nextSleepRetryMs;
     private static bool inputSinceSuspend;
     private static IntPtr hibTimer = IntPtr.Zero;
@@ -359,6 +361,16 @@ internal static class SleepGuard
         audioDeviceEnum = null;
     }
 
+    // Called once per tick; remembers when audio was last actually playing.
+    private static void SampleAudio()
+    {
+        try
+        {
+            if (IsAudioPlaying()) lastAudioMs = WallMs();
+        }
+        catch { }
+    }
+
     private static bool IsAudioPlaying()
     {
         try
@@ -481,7 +493,10 @@ internal static class SleepGuard
         nextSleepRetryMs = 0;
     }
 
-    private static void RequestSleep(double idle)
+    // Returns true when the machine really slept (and the resume was handled), or
+    // hibernated; false when the request was refused so the caller can still turn
+    // the display off instead of doing nothing.
+    private static bool RequestSleep(double idle)
     {
         Log(string.Format(CultureInfo.InvariantCulture,
             "IDLE {0:F0}s >= sleep threshold {1}s -> requesting suspend (session S3)", idle, sleepSec));
@@ -510,6 +525,21 @@ internal static class SleepGuard
         int err = Marshal.GetLastWin32Error();
         long elapsedMs = WallMs() - wallBefore;
 
+        // A driver holding a "system required" power request (powercfg /requests
+        // shows it as "[DRIVER] 旧的内核调用程序" / "Legacy Kernel Caller") can make
+        // the polite request return TRUE instantly without ever sleeping. Escalate
+        // to a forced suspend, which the kernel performs regardless of app/driver
+        // vetoes.
+        if ((!ok || elapsedMs < 2000) && !inputSinceSuspend)
+        {
+            Log("polite suspend did not sleep (ok=" + ok + " err=" + err + " after " + elapsedMs +
+                "ms) -> retrying with force=true");
+            wallBefore = WallMs();
+            ok = SetSuspendState(false, true, false);
+            err = Marshal.GetLastWin32Error();
+            elapsedMs = WallMs() - wallBefore;
+        }
+
         if (testWake != IntPtr.Zero) CancelTimer(ref testWake);
 
         if (!ok)
@@ -517,7 +547,7 @@ internal static class SleepGuard
             CancelHibTimer();
             Log("suspend call FAILED, win32 err=" + err + "; retry in 60s");
             nextSleepRetryMs = clock.ElapsedMilliseconds + 60000;
-            return;
+            return false;
         }
         if (elapsedMs < 2000)
         {
@@ -527,7 +557,7 @@ internal static class SleepGuard
             Log("suspend request returned after " + elapsedMs +
                 "ms without sleeping (blocked by a power request?) -> retry in 30s");
             nextSleepRetryMs = clock.ElapsedMilliseconds + 30000;
-            return;
+            return false;
         }
 
         // We really slept and are back.
@@ -539,7 +569,7 @@ internal static class SleepGuard
                 Log("slept " + (elapsedMs / 1000) + "s, hibernate transition time reached" +
                     (inputSinceSuspend ? " (input seen)" : ""));
                 HibernateNow("after " + (elapsedMs / 1000) + "s of sleep");
-                return;
+                return true;
             }
             CancelHibTimer();
             Log("woken after " + (elapsedMs / 1000) + "s of sleep before the hibernate transition; " +
@@ -552,12 +582,18 @@ internal static class SleepGuard
 
         lastRealMs = clock.ElapsedMilliseconds;
         displayOff = false;
+        return true;
     }
 
     private static void OnTick()
     {
         long now = clock.ElapsedMilliseconds;
         double idle = (now - lastRealMs) / 1000.0;
+
+        // Sample audio every second: a 1-second notification "ding" must not
+        // postpone the display for the whole idle period, so the display branch
+        // only looks at how recently real audio was playing.
+        if (displaySec > 0) SampleAudio();
 
         // Direct hibernate while still awake (also covers the case where the sleep
         // request was refused and the machine kept running).
@@ -570,15 +606,16 @@ internal static class SleepGuard
 
         if (sleepSec > 0 && idle >= sleepSec && now >= nextSleepRetryMs)
         {
-            RequestSleep(idle);
-            return;
+            // If the machine refuses to sleep (another power request is holding it
+            // awake), fall through and at least turn the display off.
+            if (RequestSleep(idle)) return;
         }
 
         if (displaySec > 0 && idle >= displaySec && !displayOff)
         {
             // Exception requested by the user: keep the screen awake while
             // audio/video is playing, but do NOT postpone sleep/hibernate.
-            if (IsAudioPlaying())
+            if (WallMs() - lastAudioMs < AudioGraceMs)
             {
                 if (!displayPostponed)
                 {
