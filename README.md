@@ -79,6 +79,8 @@ Get-Content "$env:LOCALAPPDATA\SleepGuard\sleep-guard.log" -Tail 30
 | `--sleep <sec>` | `600` | Suspend to RAM after N seconds of real idle (`0` = never) |
 | `--hibernate <sec>` | `0` | Hibernate after N seconds of **total** idle; must be `> --sleep` (`0` = never) |
 | `--phantom <a,b>` | `VID_1D6B&PID_0122` | Comma-separated device-name substrings to ignore (case-insensitive, matches anywhere in the raw-input device name) |
+| `--phantom-audio <a,b>` | `网易UU远程,UU远程` | Comma-separated **audio-session display names** that must not count as "media is playing" (see below) |
+| `--audio-debug` | off | Log every audio session state and a 30 s heartbeat (noisy; for diagnosis only) |
 | `--log <path>` | `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` | Log file (rotated to `.old` at 1 MB) |
 | `--wake <sec>` | `0` | **Self-test only**: arm a resume timer before suspending so the machine wakes itself |
 | `--hib-wake <sec>` | `0` | **Self-test only**: same for the hibernate step |
@@ -111,6 +113,23 @@ powercfg /lastwake
 Watch the log: `audio/video is playing -> display-off postponed` while it plays, then
 `turning monitors off` right after the audio stops (within one tick, ≤ 1 s).
 
+### Beware of "phantom" audio sessions
+
+Some remote-desktop / streaming tools (网易UU远程 on the development machine) keep an audio
+session in `AudioSessionStateActive` **permanently**, even with nothing audible. Counting it would
+keep the display on forever — the same class of bug as a phantom HID device, just at the audio layer.
+
+If your log repeats `display-off postponed` while nothing is playing, run with `--audio-debug` and
+look at the session list:
+
+```
+audio-debug: session[1] state=1 name=网易UU远程 -> ignored (phantom)
+audio-debug: playing=False
+```
+
+Add the offending display name to `--phantom-audio` (default already covers 网易UU远程 / UU远程).
+The engine binary build `SleepGuard.exe --audio-debug --display 15` is the quickest way to check.
+
 ## How it works (short version)
 
 1. Hidden message-only window + `RegisterRawInputDevices(..., RIDEV_INPUTSINK)` for mouse,
@@ -129,7 +148,9 @@ Watch the log: `audio/video is playing -> display-off postponed` while it plays,
    target and calls `SetSuspendState(TRUE, ...)`. If real input arrived in the meantime, the
    hibernate step is cancelled.
 6. Audio exception: CoreAudio `IAudioSessionManager2` session enumeration on the default render
-   endpoint; any `AudioSessionStateActive` session postpones monitor-off.
+   endpoint; any `AudioSessionStateActive` session postpones monitor-off. Sessions whose display name
+   matches `--phantom-audio` are skipped, and the display comes back on the next tick after the last
+   real sound (10 s grace) — sleep/hibernate timing is untouched.
 7. Log lines are written to `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` (rotated at 1 MB).
 
 ## If you only want a quick one-off diagnosis
@@ -155,6 +176,8 @@ handy to prove the problem exists before/after.
 - Runs in the interactive desktop session only (that is where raw input and `SC_MONITORPOWER` live).
 - Some fullscreen-exclusive games ignore the monitor-off message. Sleep/hibernate still work.
 - Silent video (no audio stream) is **not** detected by the audio exception; only audio sessions.
+- A remote-desktop tool can keep a render session `Active` with nothing audible — add its display
+  name to `--phantom-audio` (网易UU远程 is pre-configured). Otherwise the display never turns off.
 - The hibernate resume timer may fire 30–80 s late on some firmware. Harmless in normal use
   (you wake it with the keyboard).
 - Tested on Windows 11 (build 26300), x64, .NET Framework 4.8. Windows 10 should work; ARM64 is

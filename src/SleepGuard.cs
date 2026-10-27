@@ -55,6 +55,13 @@ internal static class SleepGuard
     private static int wakeSec = 0;          // self-test only: wake from sleep after N s
     private static int hibWakeSec = 0;       // self-test only: wake from hibernate after N s
     private static string[] phantomNames = new string[] { "VID_1D6B&PID_0122" };
+
+    // Audio-session display names that must not count as "media is playing".
+    // Remote-desktop / streaming tools keep a render session Active all the time
+    // even when nothing is audible (网易UU远程 on this machine); counting it would
+    // keep the display on forever.
+    private static string[] phantomAudioNames = new string[] { "网易UU远程", "UU远程" };
+
     private static string logPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "SleepGuard", "sleep-guard.log");
@@ -67,6 +74,9 @@ internal static class SleepGuard
     private static bool displayPostponed;   // audio/video is playing -> display-off deferred
     private static long lastAudioMs;        // wall ms of the last tick that saw real audio
     private const int AudioGraceMs = 10000; // keep the display on this long after the last sound
+    private static bool audioWasPlaying;    // for start/stop transition logging
+    private static bool audioDebug;         // --audio-debug: heartbeat + every sample in the log
+    private static long lastHeartbeatMs;
     private static long nextSleepRetryMs;
     private static bool inputSinceSuspend;
     private static IntPtr hibTimer = IntPtr.Zero;
@@ -366,9 +376,27 @@ internal static class SleepGuard
     {
         try
         {
-            if (IsAudioPlaying()) lastAudioMs = WallMs();
+            bool playing = IsAudioPlaying();
+            if (playing)
+            {
+                lastAudioMs = WallMs();
+                if (!audioWasPlaying)
+                {
+                    audioWasPlaying = true;
+                    Log("audio/video playback started -> display-off will be postponed");
+                }
+            }
+            else if (audioWasPlaying)
+            {
+                audioWasPlaying = false;
+                Log("audio/video playback stopped");
+            }
+            if (audioDebug) Log("audio-debug: playing=" + playing);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            if (audioDebug) TryLog("audio-debug: sample failed: " + ex.Message);
+        }
     }
 
     private static bool IsAudioPlaying()
@@ -387,7 +415,7 @@ internal static class SleepGuard
 
             Guid iid = typeof(IAudioSessionManager2).GUID;
             object mgrObj;
-            if (audioDefaultDevice.Activate(ref iid, 0, IntPtr.Zero, out mgrObj) != 0 || mgrObj == null)
+            if (audioDefaultDevice.Activate(ref iid, 23 /* CLSCTX_ALL */, IntPtr.Zero, out mgrObj) != 0 || mgrObj == null)
             {
                 ResetAudioCache();
                 return false;
@@ -402,7 +430,7 @@ internal static class SleepGuard
             }
 
             int count;
-            if (sessions.GetCount(out count) != 0 || count <= 0) return false;
+            if (sessions.GetCount(out count) != 0) count = 0;
             for (int i = 0; i < count; i++)
             {
                 object o;
@@ -410,7 +438,25 @@ internal static class SleepGuard
                 IAudioSessionControl ctl = o as IAudioSessionControl;
                 if (ctl == null) continue;
                 int state;
-                if (ctl.GetState(out state) == 0 && state == 1) return true;   // AudioSessionStateActive
+                int hr = ctl.GetState(out state);
+                string name = "";
+                try { ctl.GetDisplayName(out name); } catch { name = ""; }
+                if (name == null) name = "";
+
+                // Remote-desktop / streaming tools keep a render session in the
+                // Active state all the time, playing or not (网易UU远程 does this
+                // on this machine). Such sessions are ignored, otherwise the
+                // display could never turn off.
+                if (IsPhantomAudio(name))
+                {
+                    if (audioDebug) TryLog("audio-debug: session[" + i + "] state=" + state +
+                        " name=" + name + " -> ignored (phantom)");
+                    continue;
+                }
+
+                if (audioDebug) TryLog("audio-debug: session[" + i + "] hr=" + hr + " state=" + state +
+                    " name=" + name);
+                if (hr == 0 && state == 1) return true;   // AudioSessionStateActive
             }
             return false;
         }
@@ -419,6 +465,15 @@ internal static class SleepGuard
             ResetAudioCache();
             return false;
         }
+    }
+
+    private static bool IsPhantomAudio(string displayName)
+    {
+        for (int i = 0; i < phantomAudioNames.Length; i++)
+        {
+            if (displayName.IndexOf(phantomAudioNames[i], StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        }
+        return false;
     }
 
     // Wall clock in ms. Stopwatch/QPC time can stand still across S3/S4, wall
@@ -595,6 +650,14 @@ internal static class SleepGuard
         // only looks at how recently real audio was playing.
         if (displaySec > 0) SampleAudio();
 
+        if (audioDebug && WallMs() - lastHeartbeatMs >= 30000)
+        {
+            lastHeartbeatMs = WallMs();
+            Log(string.Format(CultureInfo.InvariantCulture,
+                "heartbeat: idle={0:F0}s displayOff={1} lastAudio={2:F0}s ago", idle, displayOff,
+                (WallMs() - lastAudioMs) / 1000.0));
+        }
+
         // Direct hibernate while still awake (also covers the case where the sleep
         // request was refused and the machine kept running).
         if (hibernateSec > 0 && idle >= hibernateSec && now >= nextSleepRetryMs)
@@ -749,9 +812,21 @@ internal static class SleepGuard
                     }
                     if (list.Count > 0) phantomNames = list.ToArray();
                     i++; break;
+                case "--phantom-audio":
+                    if (v == null) return false;
+                    List<string> alist = new List<string>();
+                    foreach (string p in v.Split(','))
+                    {
+                        string t = p.Trim();
+                        if (t.Length > 0) alist.Add(t);
+                    }
+                    if (alist.Count > 0) phantomAudioNames = alist.ToArray();
+                    i++; break;
                 case "--log":
                     if (v == null) return false;
                     logPath = v; i++; break;
+                case "--audio-debug":
+                    audioDebug = true; break;
                 default:
                     Log("unknown argument ignored: " + a);
                     break;
@@ -791,7 +866,8 @@ internal static class SleepGuard
         Log("==================== SleepGuard start ====================");
         Log("config: display=" + displaySec + "s sleep=" + sleepSec + "s hibernate=" + hibernateSec +
             "s wake=" + wakeSec + "s hib-wake=" + hibWakeSec + "s phantom=[" +
-            string.Join(",", phantomNames) + "] log=" + logPath);
+            string.Join(",", phantomNames) + "] phantom-audio=[" +
+            string.Join(",", phantomAudioNames) + "] log=" + logPath);
         Log("SeShutdownPrivilege enabled=" + EnableShutdownPrivilege());
 
         string className = "SleepGuardWindowClass";
