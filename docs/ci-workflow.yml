@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (csc from .NET Framework, no SDK needed)
+        shell: pwsh
+        run: ./build.ps1 -Clean
+
+      - name: Smoke test (observational only: no display/sleep actions)
+        shell: pwsh
+        run: |
+          $log = Join-Path $PWD 'ci.log'
+          $p = Start-Process -FilePath '.\dist\SleepGuard.exe' `
+                             -ArgumentList "--display 0 --sleep 0 --hibernate 0 --log `"$log`"" -PassThru
+          Start-Sleep -Seconds 4
+          if (-not (Test-Path $log)) { throw 'SleepGuard wrote no log file' }
+          Get-Content $log
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if (-not (Select-String -Path $log -Pattern 'ready: watching real input' -Quiet)) {
+            throw 'SleepGuard did not reach the ready state'
+          }
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: SleepGuard-win-x64
+          path: dist/*.exe
+          if-no-files-found: error

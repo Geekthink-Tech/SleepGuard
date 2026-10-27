@@ -1,0 +1,6 @@
+# Normalize line endings so the repo works on Windows and on CI.
+* text=auto
+*.ps1 text eol=crlf
+*.cs  text eol=crlf
+*.md  text eol=lf
+*.yml text eol=lf

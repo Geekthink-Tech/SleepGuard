@@ -1,0 +1,17 @@
+# build output
+dist/
+obj/
+bin/
+
+# logs / local artifacts
+*.log
+*.log.old
+*.err.txt
+selftest.log
+quiet-probe-log.txt
+sleep-monitor-log.txt
+
+# editors / VS
+.vs/
+*.user
+*.suo
