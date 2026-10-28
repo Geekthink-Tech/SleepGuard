@@ -1,4 +1,4 @@
-﻿# SleepGuard
+# SleepGuard
 
 **A "phantom-input aware" idle watchdog for Windows.** It turns the monitor off, suspends and
 hibernates on a *real* user-idle clock, ignoring HID devices that keep spamming input reports.
@@ -246,6 +246,42 @@ suspend lasts a few seconds, then wakes itself) and start it once from a task an
 The phantom HID can bring the panel back up after `SC_MONITORPOWER` was sent. The guard no longer
 assumes "off" is final: while nobody is here (`idle >= display` and no real input) it re-sends
 `SC_MONITORPOWER` every 45 s, and any real input cancels that until the next idle period.
+
+## v1.1.2: "it blanked my screen while I was typing"
+
+Three separate defects were found after the watchdog blanked the display of a user who was typing.
+All three are fixed in v1.1.2; the build is now `-target:exe` instead of `-target:winexe`.
+
+1. **`WM_INPUT` lParam misuse — crash with 0xC0000005.** `lParam` is an `HRAWINPUT` *handle*, not a
+   pointer to `RAWINPUTHEADER`. Calling `Marshal.PtrToStructure(lParam, …)` dereferenced invalid
+   memory and killed the process inside `VCRUNTIME140_CLR0400.dll` (error offset `0x1416`) right after
+   the first raw-input message. The monitor had already been blanked and no process was left alive to
+   restore it — from the outside that looks exactly like "the screen crashed". Fixed by calling
+   `GetRawInputData` twice (size query, then copy into an `AllocHGlobal` buffer), the same way
+   `tools/RawProbe.cs` does it.
+
+2. **`SetSuspendState` marshalling.** The prototype is
+   `BOOLEAN SetSuspendState(BOOLEAN hibernate, BOOLEAN forceCritical, BOOLEAN disableWakeEvent)`.
+   Declaring the return type as `bool` makes the CLR read the whole 32-bit `EAX`, whose upper bytes
+   are undefined: a failed call can look successful (`ok=True err=1314`) and a successful one can look
+   failed. Declare it `byte` and compare `!= 0`.
+
+3. **GUI-subsystem processes can receive no raw input at all.** On Windows 11 26300 a process compiled
+   `/target:winexe` received **zero** `WM_INPUT` for mouse and keyboard, while byte-identical code
+   compiled `/target:exe`, launched the same way (WMI), in the same session and desktop (WinSta0\
+   Default, both elevated) and registering the same five usage pairs, received every injected and real
+   event. `AllocConsole()` at runtime does not change the outcome. SleepGuard therefore ships as a
+   console-subsystem binary and hides its console immediately via
+   `ShowWindow(GetConsoleWindow(), SW_HIDE)` in `Main`. Reproduce with the bundled probe:
+
+   ```powershell
+   csc /target:exe    /out:probe-exe.exe    tools\RawProbe.cs
+   csc /target:winexe /out:probe-winexe.exe tools\RawProbe.cs
+   # inject input, then compare the two log files
+   ```
+
+Low-level hooks were removed in v1.1.x: they installed successfully (`mouse=True keyboard=True`) but
+never fired for this process, so the guard now relies on raw input plus a 20 ms `GetCursorPos` poll.
 
 ## Uninstall
 
