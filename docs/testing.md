@@ -73,6 +73,23 @@ IDLE 15s >= display threshold 15s -> turning monitors off
 第 2 步就失败、且 `list` 一直 `unreadable`：显示器 OSD 里关着 DDC/CI，或者中间接了转接器/KVM，
 守护会自动降级为纯 `SC_MONITORPOWER`（能黑屏但会被幻影输入叫亮），也可以显式 `--no-ddc`。
 
+## 三·六、暂停代理层：`run-pause-test.ps1`
+
+验证的是"守护写请求 → 代理挂起 HiMOS → 守护写恢复 → 代理恢复 HiMOS"这条链路，不碰屏幕、不碰电源。
+
+- 前提：SleepGuardAgent 任务已注册。脚本自己会检查，代理没跑就 Start-ScheduledTask。
+- 用 --test-pause 启动一次性守护：启动时写入 pause 请求，2 秒后写入 esume 请求。
+- 断言（5 项，全 PASS 才算通过）：
+  1. 代理在跑；
+  2. 守护日志出现 pause-app: requested pause of [HiMOS]；
+  3. gent.log 出现 `paused 5 process(es) of [HiMOS]: <pids>`；
+  4. gent.log 出现 `resumed 5 process(es)`；
+  5. Get-Process HiMOS 仍然有 5 个进程（没有被挂死）。
+- 看什么：	ests\artifacts\pause-test.log（守护侧）、%LOCALAPPDATA%\SleepGuard\agent.log（代理侧）、
+  %LOCALAPPDATA%\SleepGuard\pause-state.txt（paused:<pids> / idle / 
+o-app / guard-gone）。
+- 失败排查：代理侧没有 paused 行说明请求文件路径不一致（--pause-request 与实际 gent.log 里
+  equest= 对比），或者代理不是普通 PowerShell 会话启动的。
 ## 四、睡眠层：`run-sleep-test.ps1 -Force`
 
 ```powershell

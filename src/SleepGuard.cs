@@ -16,7 +16,12 @@
 //   --phantom <s1,s2> device-name substrings to ignore            (default VID_1D6B&PID_0122)
 //   --wake    <sec>   SELF-TEST ONLY: arm a resume timer before suspending
 //   --log     <path>  log file path
-//   --no-ddc          do not use DDC/CI panel power; only SC_MONITORPOWER
+//   --pause-app <a,b> suspend these processes while the screens are off (HiMOS) and
+//                     resume them on real input, crash or exit
+//   --ddc             OPT-IN: also put the panels into DDC/CI DPMS standby.
+//                     WARNING: on some monitors (DisplayPort) DPMS off drops the
+//                     link, Windows then loses the display and nothing can wake it
+//                     again - the power button is needed. Off by default.
 //   --once            log the resolved configuration and keep running (default)
 
 using System;
@@ -86,7 +91,23 @@ internal static class SleepGuard
     private static bool inputSinceSuspend;
     private static IntPtr hibTimer = IntPtr.Zero;
 
-    private static bool ddcEnabled = true;   // --no-ddc disables DDC/CI panel power control
+    // DDC/CI panel power is opt-in: SC_MONITORPOWER alone is always safe, while a DDC
+    // DPMS off can power the panel down so hard that the DisplayPort link drops and
+    // Windows can no longer send the matching "on" (the user has to press the button).
+    private static bool ddcEnabled;          // --ddc enables DDC/CI panel power control
+
+    // --pause-app a,b: while the screens are off, suspend these processes.
+    //
+    // Why: on this machine HiMOS (the water-block display app) writes a HID
+    // consumer-control report about 3x/s through USB\VID_1D6B&PID_0122. Windows sees
+    // that as user activity, so a SC_MONITORPOWER blank comes back on immediately and
+    // the OS idle timer never ages. Pausing the writer is what makes a plain OS blank
+    // stay dark: no DDC, no physical power-off, and both monitors blank at once.
+    private static string[] pauseApps = new string[0];
+    private static bool appsPaused;
+    private static bool testPause;           // --test-pause: exercise pause/resume once at startup
+    private static string pauseRequestPath = ""; // --pause-request: where the agent watches
+    private static string lastPauseRequest = ""; // last request written (skip duplicates)
     private static bool ddcUnavailable;      // no monitor accepted a DDC write on this box
     private static bool panelDark;           // we asked the panels to go into DPMS standby
 
@@ -317,6 +338,19 @@ internal static class SleepGuard
 
     private static bool EnableShutdownPrivilege()
     {
+        return EnablePrivilege("SeShutdownPrivilege");
+    }
+
+    // SeDebugPrivilege is what lets us OpenProcess(PROCESS_SUSPEND_RESUME) on the phantom-input
+    // writer. Without it the guard gets err=5 (ACCESS_DENIED) even though it runs elevated as the
+    // same user, because the target processes are protected by the vendor driver.
+    private static bool EnableDebugPrivilege()
+    {
+        return EnablePrivilege("SeDebugPrivilege");
+    }
+
+    private static bool EnablePrivilege(string name)
+    {
         IntPtr token = IntPtr.Zero;
         try
         {
@@ -324,7 +358,7 @@ internal static class SleepGuard
                     TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token)) return false;
 
             LUID luid;
-            if (!LookupPrivilegeValueW(null, "SeShutdownPrivilege", out luid)) return false;
+            if (!LookupPrivilegeValueW(null, name, out luid)) return false;
 
             TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
             tp.PrivilegeCount = 1;
@@ -812,7 +846,8 @@ internal static class SleepGuard
 
         lastRealMs = clock.ElapsedMilliseconds;
         displayOff = false;
-        if (panelDark) WakeMonitors();   // DDC standby survives an S3 cycle
+        if (panelDark) WakeMonitors();
+        ResumeIdleApps("real input");   // DDC standby survives an S3 cycle
         return true;
     }
 
@@ -882,6 +917,7 @@ internal static class SleepGuard
             displayOff = true;
             displayPostponed = false;
             nextDisplayRetryMs = now + DisplayRetryMs;
+            PauseIdleApps();   // stop the phantom HID writer so the blank stays dark
         }
         else if (displaySec > 0 && idle >= displaySec && displayOff && now >= nextDisplayRetryMs &&
                  WallMs() - lastAudioMs >= AudioGraceMs)
@@ -893,6 +929,60 @@ internal static class SleepGuard
             TurnOffMonitors();
             nextDisplayRetryMs = now + DisplayRetryMs;
         }
+    }
+
+    private static string PauseRequestPath()
+    {
+        if (!string.IsNullOrEmpty(pauseRequestPath)) return pauseRequestPath;
+        string dir = Path.GetDirectoryName(logPath);
+        if (string.IsNullOrEmpty(dir))
+            dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SleepGuard");
+        return Path.Combine(dir, "pause-request.txt");
+    }
+
+    // Write only on a state change, otherwise the 20 ms input tick would rewrite the same
+    // request dozens of times per second and spam both logs.
+    private static bool WritePauseRequest(string text)
+    {
+        if (text == lastPauseRequest) return false;
+        try
+        {
+            string p = PauseRequestPath();
+            string dir = Path.GetDirectoryName(p);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllText(p, text);
+            lastPauseRequest = text;
+            return true;
+        }
+        catch (Exception ex) { TryLog("pause-app: request write failed: " + ex.Message); return false; }
+    }
+
+    // Handing the pause/resume to an out-of-process agent
+    // ---------------------------------------------------
+    // The guard cannot suspend the phantom-input writer itself on this machine: a .NET exe
+    // started by Task Scheduler / WMI gets a filtered process view here (102 processes
+    // visible while Windows PowerShell in the same session sees 424, so HiMOS is simply not
+    // in the list) and OpenProcess(PROCESS_SUSPEND_RESUME) on a pid it is handed returns
+    // err=5 even with SeDebugPrivilege enabled. Windows PowerShell in a normal session can do
+    // both, so the guard only writes a request file and tests\sleepguard-agent.ps1 performs
+    // the actual suspend/resume. Protocol (UTF-8, one word per line):
+    //     pause            -> agent suspends the names listed in pause-apps.txt
+    //     resume           -> agent resumes whatever it suspended
+    private static void PauseIdleApps()
+    {
+        if (pauseApps.Length == 0 || appsPaused) return;
+        appsPaused = true;
+        string list = string.Join(",", pauseApps);
+        if (WritePauseRequest("pause" + Environment.NewLine + list + Environment.NewLine))
+            Log("pause-app: requested pause of [" + list + "] -> " + PauseRequestPath());
+    }
+
+    private static void ResumeIdleApps(string why)
+    {
+        if (!appsPaused) return;
+        appsPaused = false;
+        if (WritePauseRequest("resume" + Environment.NewLine + "(" + why + ")" + Environment.NewLine))
+            Log("pause-app: requested resume (" + why + ") -> " + PauseRequestPath());
     }
 
     // Raw-input device handle -> "is this the phantom HID?" verdict, plus the
@@ -922,6 +1012,7 @@ internal static class SleepGuard
         // wheel click: the OS only lights the display for input it turns into
         // activity, and we blanked the monitor behind its back.
         if (panelDark) WakeMonitors();
+        ResumeIdleApps("real input");
     }
 
     // Cursor movement is a real user action; the phantom HID never moves the
@@ -1117,8 +1208,26 @@ internal static class SleepGuard
                     logPath = v; i++; break;
                 case "--audio-debug":
                     audioDebug = true; break;
-                case "--no-ddc":
-                    ddcEnabled = false; break;
+                case "--ddc":
+                    ddcEnabled = true; break;
+                case "--pause-app":
+                    if (v == null) return false;
+                    {
+                        List<string> plist = new List<string>();
+                        foreach (string p in v.Split(','))
+                        {
+                            string t = p.Trim();
+                            if (t.Length > 0) plist.Add(t);
+                        }
+                        pauseApps = plist.ToArray();
+                    }
+                    i++; break;
+                case "--pause-request":
+                    if (v == null) return false;
+                    pauseRequestPath = v; i++; break;
+                case "--test-pause":
+                    testPause = true;
+                    break;
                 default:
                     Log("unknown argument ignored: " + a);
                     break;
@@ -1153,6 +1262,7 @@ internal static class SleepGuard
         {
             TryLog("UNHANDLED EXCEPTION: " + e.ExceptionObject);
             ApplyMonitorPower(true);   // never leave the panels dark behind a dead guard
+            ResumeIdleApps("crash");   // and never leave the water-block app frozen
         };
 
         bool isNew;
@@ -1173,8 +1283,10 @@ internal static class SleepGuard
         Log("config: display=" + displaySec + "s sleep=" + sleepSec + "s hibernate=" + hibernateSec +
             "s wake=" + wakeSec + "s hib-wake=" + hibWakeSec + "s phantom=[" +
             string.Join(",", phantomNames) + "] phantom-audio=[" +
-            string.Join(",", phantomAudioNames) + "] log=" + logPath);
+            string.Join(",", phantomAudioNames) + "] pause-app=[" +
+            string.Join(",", pauseApps) + "] log=" + logPath);
         Log("SeShutdownPrivilege enabled=" + EnableShutdownPrivilege());
+        Log("SeDebugPrivilege enabled=" + EnableDebugPrivilege());
         Log("monitor power control: ddc=" + ddcEnabled);
         if (ddcEnabled) ApplyMonitorPower(true);   // a previous run may have died with the panels dark
 
@@ -1270,7 +1382,17 @@ internal static class SleepGuard
         lastRealMs = clock.ElapsedMilliseconds;
         lastAudioMs = WallMs();
         displayOff = false;
-        Log("ready v1.1.3 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; ddc=" + ddcEnabled);
+        ResumeIdleApps("startup, previous guard died while paused");
+        Log("ready v1.2.0 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; ddc=" + ddcEnabled);
+
+        if (testPause)
+        {
+            Log("test-pause: pausing [" + string.Join(",", pauseApps) + "] for 2s");
+            PauseIdleApps();
+            System.Threading.Thread.Sleep(2000);
+            ResumeIdleApps("test-pause");
+            Log("test-pause: done");
+        }
 
         MSG msg;
         int gm;
@@ -1283,6 +1405,7 @@ internal static class SleepGuard
 
         Log("message loop ended; exiting");
         ApplyMonitorPower(true);   // never leave the panels dark behind a dead guard
+        ResumeIdleApps("exit");
         if (instanceMutex != null) instanceMutex.ReleaseMutex();
         return 0;
     }

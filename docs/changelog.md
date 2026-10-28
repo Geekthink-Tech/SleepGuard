@@ -2,6 +2,29 @@
 
 时间均为 2026 年 10 月，机器为本仓库的开发机（Windows 11 build 26300，双显示器，水冷屏 HID，网易UU远程）。
 
+## v1.2.0 — 2026-10-28
+
+关屏期间**暂停伪造输入的进程**（本机是水冷屏软件 HiMOS），彻底解决"屏幕刚黑就自己亮"。
+
+- 背景：v1.1.3 的 DDC 深度 off 在 ASUS XG27UCG 上会断 DisplayPort 链路（系统里只剩 AOC，显示器
+  只能按物理电源键唤醒），这是不可接受的，用户明确要求不要物理断电。
+- 方案：SC_MONITORPOWER 关屏 + 关屏时暂停 --pause-app 指定的进程（本机 HiMOS 每秒约 3 条
+  consumer-control HID 报文，正是它让 Windows 认为"用户一直在操作"），第一个真实输入到来时恢复。
+- 为什么必须独立代理：Task Scheduler / WMI 启动的 .NET 进程在参考机上进程视图被过滤——守护只能
+  看到 102 个进程，同会话的 Windows PowerShell 能看到 424 个，HiMOS 在 Toolhelp、
+  WTSEnumerateProcesses、NtQuerySystemInformation、Win32_Process 里全部缺席；即使启用
+  SeDebugPrivilege，对拿到的 pid 调 OpenProcess(PROCESS_SUSPEND_RESUME) 仍是 err=5。
+  于是守护只写请求文件 pause-request.txt，由 SleepGuardAgent 登录任务（普通 Windows
+  PowerShell）执行 NtSuspendProcess / NtResumeProcess，真实 pid 写入 pause-state.txt。
+- 请求只在状态变化时写一次（否则 20 ms 的输入 tick 每秒重写几十次、两个日志都被刷爆）。
+- 崩溃安全：暂停之后若守护消失 5 秒，代理自动恢复进程；代理用 Global\SleepGuardAgent mutex
+  保证单实例；launcher 发现代理没在跑会 Start-ScheduledTask SleepGuardAgent。
+- DDC 改为 opt-in：默认关闭，只有显式 --ddc 才启用（--no-ddc 已移除）。
+- install.ps1 新增 -PauseApp（默认 HiMOS）并注册 SleepGuardAgent；uninstall.ps1 一并清理。
+- 新增 	ests\run-pause-test.ps1：5 项断言（代理在跑 → 守护写 pause 请求 → 代理挂起 5 个
+  HiMOS → 代理恢复 → HiMOS 仍在运行），2026-10-28 23:40 与 23:41 两次实测 PASS。
+- 清理：删掉守护里已被证明不可行的"自己枚举+挂起进程"代码（Toolhelp / WMI / pid 文件三条
+  回退路径，约 140 行），dist\SleepGuard.exe 从 37,376 B 降到 33,792 B，banner 升至 v1.2.0。
 ## v1.1.3 — 2026-10-28
 
 修“息屏后马上自动亮”。

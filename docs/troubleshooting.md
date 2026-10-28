@@ -7,8 +7,10 @@
 | 现象 | 真正原因 | 处理 |
 |---|---|---|
 | 人离开后屏幕一直亮、电脑从不睡眠 | 多个 SYSTEM 电源请求常驻：GameViewer（网易UU远程）`PreventSleep=1`、AMD HDMI 音频活动流；同时水冷屏 HID 每 25 秒往系统灌 72 个输入事件，把空闲计时器一直刷新 | 关掉 GameViewer 的“防止睡眠”、退出不用的音频播放；用 SleepGuard 的幻影设备过滤（`--phantom "VID_1D6B&PID_0122"`） |
-| 屏幕关了又自己亮，反复闪烁 | 水冷屏 HID（consumer control）会触发显示器重新上电；`SC_MONITORPOWER` 只停止 Windows 输出画面，任何输入事件都会把它重新点亮 | v1.0.4 起每 45 s 重发；v1.1.3 起改用 **DDC/CI 硬件 standby**（VCP `0xD6`），显示器自己保持，输入叫不醒，真实输入时才 `SetVCPFeature(0xD6, 1)` 唤醒。验证：`tools\MonitorPower.exe list` 应为 `power=standby` |
-| 关屏后显示器立刻又亮，且 `tools\MonitorPower.exe list` 显示 `power=unreadable` | 显示器 OSD 关闭了 DDC/CI，或中间接了转接器/采集卡/KVM | 在显示器 OSD 里打开 DDC/CI；确实不支持时守护会自动降级为纯 `SC_MONITORPOWER`，也可显式 `--no-ddc` |
+| 屏幕关了又自己亮，反复闪烁 | 水冷屏 HID（consumer control）会触发显示器重新上电；`SC_MONITORPOWER` 只停止 Windows 输出画面，任何输入事件都会把它重新点亮 | **v1.2.0 起**关屏时暂停写报文的应用（`--pause-app HiMOS`，由 `SleepGuardAgent` 任务执行），真实输入才恢复；同时每 45 s 重发一次关屏兜底。DDC/CI 硬件 standby 仍可用但改为 opt-in（`--ddc`），因为在部分显示器上深度 DPMS 会断 DisplayPort 链路 |
+| 关屏后 HiMOS 没有被暂停 / 日志里没有任何 `pause-app:` 行 | `SleepGuardAgent` 任务没注册或代理进程没在跑（被手动杀过、任务处于 Ready 但未启动） | `Get-ScheduledTask SleepGuardAgent`；`Start-ScheduledTask SleepGuardAgent`；`Get-Content "$env:LOCALAPPDATA\\SleepGuard\\agent.log" -Tail 20`。launcher 在发现代理缺失时会自动拉起它 |
+| 守护日志里 `pause-app: found 0 process(es)` / 挂起失败 `err=5` | Task Scheduler / WMI 启动的 .NET 进程在参考机上进程视图被过滤（可见 102 个进程，而同一会话的 Windows PowerShell 看到 424 个），`OpenProcess(PROCESS_SUSPEND_RESUME)` 即使启用 `SeDebugPrivilege` 也返回 5 | 不要试图在守护里枚举/挂起进程——改为写请求文件，由普通 PowerShell 代理执行（v1.2.0 架构） |
+| 用 `--ddc` 后显示器物理断电、系统里只剩一台显示器 | DDC 深度 `DPMS off`(4) 会让部分显示器断开 DisplayPort 链路，Windows 丢失该显示器后就再也发不了 `DPMS on`，只能按显示器电源键 | 不要用 `--ddc`（默认已关闭）。关屏请用 v1.2.0 的 `--pause-app` + `SC_MONITORPOWER` 方案 |
 | 明明在打字，屏幕却黑了 | 守护只看到光标变化：键盘/按键/滚轮全部漏检（旧版只靠 `GetCursorPos` + 低层钩子，而钩子在这台机器上装了不触发） | v1.1.2 起改用 raw input + 20 ms 轮询双通道，并用**控制台子系统**编译（见下条） |
 | 正在用电脑，屏幕突然黑掉而且再也点不亮 | `WM_INPUT` 的 `lParam` 被当成 `RAWINPUTHEADER*` 解引用（它其实是 `HRAWINPUT` 句柄）→ 原生层 `0xC0000005`（WER：`VCRUNTIME140_CLR0400.dll`，偏移 `0x1416`）。崩溃往往正好发生在关屏之后 | v1.1.1 修：`GetRawInputData` 两次调用（取长度 → 拷进 `AllocHGlobal`）再解析 |
 | 进程是 GUI 子系统时，raw input 一条都收不到 | 本机实测：同一份代码 `/target:winexe` 收 0 条，`/target:exe` 正常；连运行时 `AllocConsole()` 也救不回来 | v1.1.2 起守护用 `/target:exe` 编译，`Main` 开头把控制台窗口隐藏 |
@@ -49,6 +51,8 @@ consumer-control 键，于是 `GetLastInputInfo` 永远只有零点几秒。它�
 处理方式不是禁用设备（会让水冷屏停止显示），而是：
 
 - 守护按设备名过滤它的 raw input（`--phantom "VID_1D6B&PID_0122"`）；
-- 关屏后每 45 秒重发一次 `SC_MONITORPOWER`（v1.0.4）。
+- 关屏时由 `SleepGuardAgent` 把它整个暂停，真实输入时恢复（`--pause-app HiMOS`，v1.2.0），
+  这样关屏后系统空闲计时正常累积、屏幕也不会被它点亮；
+- 额外每 45 秒重发一次 `SC_MONITORPOWER` 兜底（v1.0.4）。
 
 音频层有同构的问题：远程软件留下恒为 Active 的会话，同样只是过滤，不禁用设备。

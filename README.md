@@ -45,7 +45,7 @@ SleepGuard solves it by keeping its own idle clock:
 
 | Real idle | Action | Notes |
 |---|---|---|
-| ≥ `--display` (default 300 s) | Turn the monitor off (`SC_MONITORPOWER`) | Postponed while audio/video is playing; re-sent every 45 s while still idle |
+| ≥ `--display` (default 300 s) | Turn the monitor off (`SC_MONITORPOWER`) | Postponed while audio/video is playing; re-sent every 45 s while still idle; `--pause-app` is paused while dark |
 | ≥ `--sleep` (default 600 s) | Suspend to RAM (S3) | Any real input wakes it instantly |
 | ≥ `--hibernate` (default 1800 s) | Hibernate (S4) | Implemented as *sleep first, then hibernate*: a resume timer wakes the machine at `--hibernate` and it hibernates |
 | any time | Real keyboard/mouse | Clock resets, display wakes |
@@ -85,6 +85,8 @@ Get-Content "$env:LOCALAPPDATA\SleepGuard\sleep-guard.log" -Tail 30
 | `--hibernate <sec>` | `0` | Hibernate after N seconds of **total** idle; must be `> --sleep` (`0` = never) |
 | `--phantom <a,b>` | `VID_1D6B&PID_0122` | Comma-separated device-name substrings to ignore (case-insensitive, matches anywhere in the raw-input device name) |
 | `--phantom-audio <a,b>` | `网易UU远程,UU远程` | Comma-separated **audio-session display names** that must not count as "media is playing" |
+| `--pause-app <a,b>` | `HiMOS` (set in install.ps1) | Comma-separated process names that write phantom input; paused while the screens are dark and resumed on the first real input. Handled by the `SleepGuardAgent` task, because the guard cannot see those processes itself on this machine |
+| `--pause-request <path>` | log directory | Where the guard writes `pause` / `resume` requests for the agent (`%LOCALAPPDATA%\SleepGuard\pause-request.txt` in production) |
 | `--audio-debug` | off | Log every audio session state and a 30 s heartbeat (noisy; diagnosis only) |
 | `--log <path>` | `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` | Log file (rotated to `.old` at 1 MB) |
 | `--wake <sec>` | `0` | **Test only**: arm a resume timer before suspending so the machine wakes itself |
@@ -121,6 +123,9 @@ tests\                    reproducible end-to-end scripts + README.md
   run-display-test.ps1    monitor really goes dark                  (screen flashes)
   run-sleep-test.ps1      real S3 + self wake                        (-Force, machine sleeps)
   run-full-selftest.ps1   build + the three stages, PASS/FAIL summary
+  run-monitor-test.ps1    DDC/CI: the panel really stays dark and wakes on input
+  run-pause-test.ps1      pause-agent protocol: guard request -> agent suspends/resumes HiMOS
+  sleepguard-agent.ps1    the pause agent itself (registered as the SleepGuardAgent task)
 
 docs\                     testing.md, troubleshooting.md, changelog.md, case-study.md, ci-workflow.yml
 ```
@@ -131,6 +136,7 @@ docs\                     testing.md, troubleshooting.md, changelog.md, case-stu
 .\tests\run-full-selftest.ps1          # build + input + monitor-off (never sleeps)
 .\tests\run-full-selftest.ps1 -Force   # also suspend/resume: the machine really sleeps
 .\tests\run-monitor-test.ps1           # panel really stays dark, real input wakes it (DDC/CI)
+.\tests\run-pause-test.ps1             # guard <-> agent pause/resume handshake (HiMOS)
 ```
 
 Each stage stops the production guard, starts a throw-away one with short thresholds, checks the
@@ -171,11 +177,18 @@ Quick manual smoke test (does not install anything):
 6. Audio exception: CoreAudio `IAudioSessionManager2` session enumeration on the default render
    endpoint; any `AudioSessionStateActive` session postpones monitor-off. Sessions whose display
    name matches `--phantom-audio` are skipped. Sleep/hibernate timing is untouched.
-7. Log lines go to `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` (rotated at 1 MB).
+7. Pause agent: when the screens go dark the guard writes `pause` + process names to
+   `pause-request.txt`; the `SleepGuardAgent` logon task (plain Windows PowerShell) suspends those
+   processes and writes the real pids to `pause-state.txt`. The first real input makes the guard
+   write `resume`, and the agent resumes them. This stops the phantom HID writer itself
+   (`--pause-app HiMOS`) so the blank stays dark without DDC tricks. If the guard disappears for
+   5 s while the app is suspended, the agent resumes it anyway so a crash cannot leave the
+   water-block screen frozen.
+8. Log lines go to `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` (rotated at 1 MB).
 
 ## Gotchas that cost the most time
 
-Full write-ups with evidence: [docs/troubleshooting.md](docs/troubleshooting.md). The five that
+Full write-ups with evidence: [docs/troubleshooting.md](docs/troubleshooting.md). The six that
 matter if you are adapting this code:
 
 1. **`WM_INPUT` lParam is an `HRAWINPUT` handle, not a `RAWINPUTHEADER*`.** Dereferencing it kills
@@ -197,6 +210,13 @@ matter if you are adapting this code:
    standby (VCP `0xD6`) holds. Verified with `tools/MonitorPower.cs`: `list` shows
    `power=standby` that survives minutes of phantom reports, whereas after `SC_MONITORPOWER` the
    VCP state still reads `power=on`.
+6. **A compiled .NET exe started by Task Scheduler/WMI can get a filtered process view.** On the
+   reference machine the guard saw 102 processes while a normal Windows PowerShell in the same
+   session saw 424, and HiMOS was absent from Toolhelp, WTS, `NtQuerySystemInformation` and
+   `Win32_Process` alike; `OpenProcess(PROCESS_SUSPEND_RESUME)` on a pid handed to it failed with
+   `err=5` even with `SeDebugPrivilege`. Hence the out-of-process pause agent. Raw input is subject
+   to the same filter: the same probe code received raw mouse input when built `/target:exe` and
+   nothing when built `/target:winexe`.
 
 ## Limitations
 
@@ -205,6 +225,9 @@ matter if you are adapting this code:
 - Silent video (no audio stream) is **not** detected by the audio exception; only audio sessions.
 - A remote-desktop tool can keep a render session `Active` with nothing audible — add its display
   name to `--phantom-audio` (`网易UU远程` is pre-configured).
+- `--pause-app` needs the `SleepGuardAgent` logon task (install.ps1 registers it). If the agent is
+  not running nothing is paused: the monitors still blank, they just light up again because of the
+  phantom HID. The launcher restarts a missing agent.
 - The hibernate resume timer may fire 30–40 s late on some firmware. Harmless in normal use.
 - Tested on Windows 11 (build 26300), x64, .NET Framework 4.8. Windows 10 should work; ARM64 is
   untested.
@@ -250,7 +273,8 @@ Or run `.\uninstall.ps1 -Purge`.
 
 **解决**：SleepGuard 用 Raw Input 自己维护"真实输入时钟"，只认真正的键鼠/笔/触控事件，每个空闲
 阈值到了就执行：5 分钟关屏 → 10 分钟睡眠 S3 → 30 分钟转休眠 S4；正在播放音视频时只推迟关屏，
-不影响睡眠/休眠。
+不影响睡眠/休眠。若某个程序（例如水冷屏软件 HiMOS）本身在不停伪造输入，关屏时会把它的进程
+**暂停**、你一操作电脑立刻恢复（`--pause-app HiMOS`，由独立的 `SleepGuardAgent` 任务执行）。
 
 **安装**（管理员 PowerShell）：
 

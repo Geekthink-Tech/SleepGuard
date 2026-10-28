@@ -22,6 +22,12 @@ if ($task) {
     Write-Host 'scheduled task "SleepGuard" was not registered'
 }
 
+$agentTask = Get-ScheduledTask -TaskName 'SleepGuardAgent' -ErrorAction SilentlyContinue
+if ($agentTask) {
+    Stop-ScheduledTask -TaskName 'SleepGuardAgent' -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName 'SleepGuardAgent' -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host 'scheduled task "SleepGuardAgent" (pause agent) removed'
+}
 Get-Process SleepGuard -ErrorAction SilentlyContinue | Stop-Process -Force
 Write-Host 'running process stopped (if there was one)'
 

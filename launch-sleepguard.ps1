@@ -2,7 +2,8 @@ param(
     [int]$Display = 300,
     [int]$Sleep = 600,
     [int]$Hibernate = 1800,
-    [string]$Phantom = 'VID_1D6B&PID_0122'
+    [string]$Phantom = 'VID_1D6B&PID_0122',
+    [string]$PauseApp = ''
 )
 
 # SleepGuard launcher
@@ -49,8 +50,38 @@ if ($existing) {
     exit 0
 }
 
+# Keep the pause agent alive. Nobody restarts a stopped script otherwise: if the agent is
+# missing when the screens go dark, HiMOS keeps writing HID reports and the monitors light up
+# again. Missing agent is not fatal - the guard simply blanks the screens the old way.
+try {
+    $agentPattern = 'sleepguard-agent\.ps1'
+    $agents = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.CommandLine -match $agentPattern })
+    if ($agents.Count -eq 0) {
+        Start-ScheduledTask -TaskName 'SleepGuardAgent' -ErrorAction Stop
+        Write-LaunchLog "started SleepGuardAgent (no agent process was running)"
+    } else {
+        Write-LaunchLog ("pause agent already running pid={0}" -f $agents[0].ProcessId)
+    }
+}
+catch {
+    Write-LaunchLog "could not start SleepGuardAgent: $($_.Exception.Message)"
+}
+
 $cmdLine = '"' + $exe + '" --display ' + $Display + ' --sleep ' + $Sleep + ' --hibernate ' + $Hibernate +
            ' --phantom "' + $Phantom + '" --log "' + $guardLog + '"'
+
+# Optional: name the process that must be paused while the screens are dark.
+#
+# HiMOS (the water-block screen app) writes a HID consumer-control report about 3 times a
+# second through USB\VID_1D6B&PID_0122. Windows counts that as user input, so a monitor blanked
+# with SC_MONITORPOWER comes back on immediately. The guard cannot suspend it directly (a .NET
+# exe started by Task Scheduler/WMI gets a filtered process view on this machine and
+# OpenProcess fails with err=5), so it only writes a request file and the "SleepGuardAgent"
+# scheduled task performs the suspend/resume - see tests\sleepguard-agent.ps1.
+if ($PauseApp) {
+    $cmdLine += ' --pause-app "' + $PauseApp + '"'
+}
 try {
     $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine }
     Write-LaunchLog "WMI create return=$($r.ReturnValue) pid=$($r.ProcessId) args=[$cmdLine]"
