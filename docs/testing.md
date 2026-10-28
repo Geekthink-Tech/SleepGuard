@@ -52,10 +52,26 @@ IDLE 15s >= display threshold 15s -> turning monitors off
 ```
 
 之后守护会在 `DisplayRetryMs`（45 s）内重复 `SC_MONITORPOWER`——因为水冷屏那个幻影 HID 可能把
-显示器重新点亮，一次性关屏并不可靠。
+显示器重新点亮，一次性关屏并不可靠（v1.1.3 起主路径改成 DDC 硬件 standby，见下一节）。
 
 屏幕真的黑了但脚本说失败，通常是日志被 `--log` 覆盖或路径写错；屏幕没黑但日志有这行，说明
 `SC_MONITORPOWER` 被驱动/显示器 DPMS 忽略（换 `powercfg /change monitor-timeout-ac 1` 做对照）。
+
+## 三·五、面板电源层：`run-monitor-test.ps1`
+
+```powershell
+.\tests\run-monitor-test.ps1
+```
+
+判据（任何一条不满足即 FAIL，并在 `finally` 里强制 `MonitorPower.exe on`，不会把你留在黑屏里）：
+
+1. 日志出现 `turning monitors off`；
+2. `tools\MonitorPower.exe list` 出现 `power=standby`；
+3. 保持 6 s 后仍是 `power=standby`（幻影 HID 每秒 ~3 条报文，证明输入叫不醒面板）；
+4. 注入真实鼠标后日志出现 `monitors woken on real input (ddc)`，且状态回到 `power=on`。
+
+第 2 步就失败、且 `list` 一直 `unreadable`：显示器 OSD 里关着 DDC/CI，或者中间接了转接器/KVM，
+守护会自动降级为纯 `SC_MONITORPOWER`（能黑屏但会被幻影输入叫亮），也可以显式 `--no-ddc`。
 
 ## 四、睡眠层：`run-sleep-test.ps1 -Force`
 

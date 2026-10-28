@@ -12,12 +12,13 @@
 .\tests\run-full-selftest.ps1 -Force
 ```
 
-## 四个脚本
+## 五个脚本
 
 | 脚本 | 会做什么 | 安全性 | 通过判据 |
 |---|---|---|---|
 | `run-input-test.ps1` | 起一个动作全关的守护（`--display 0 --sleep 0 --hibernate 0`），注入一次点击、一格滚轮、三个按键 | **安全**，不关屏不睡眠 | 日志出现 `real input detected`（或 `real raw input #`） |
 | `run-display-test.ps1` | 用 `--display 15` 起守护 | 屏幕会真的黑几秒 | 日志出现 `turning monitors off` |
+| `run-monitor-test.ps1` | 用 `--display 15` 起守护，等 `turning monitors off` 后读 DDC 电源状态，保持 6 s，再注入真实鼠标 | 屏幕会真的黑十几秒（结束时强制 `MonitorPower on`） | `power=standby` 保持 ≥6 s，且输入后日志出现 `monitors woken on real input`、状态回到 `power=on` |
 | `run-sleep-test.ps1 -Force` | 用 `--display 15 --sleep 20 --wake 25` 起守护 | **真的进 S3 并自唤醒**，约 2 分钟 | `requesting suspend (S3)` + `resumed from suspend` + 内核事件 187/42/131 齐全 + 无崩溃记录 |
 | `run-full-selftest.ps1` | 依次跑 构建 → 输入 → 关屏 → 睡眠，汇总 PASS/FAIL | 取决于参数 | 所有执行到的阶段 PASS |
 

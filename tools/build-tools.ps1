@@ -42,6 +42,7 @@ $consoleTools = @(
     'AudioSessions', # dumps CoreAudio sessions per endpoint
     'AudioTest',     # loops a system WAV so a real audio session exists
     'PlaySound',     # plays one short WAV
+    'MonitorPower',  # DDC/CI panel power (MCCS VCP 0xD6): list / off / on / watch
     'SuspendTest'    # prints token privileges, then calls SetSuspendState
 )
 

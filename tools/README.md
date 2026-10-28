@@ -38,6 +38,7 @@ v1.1.2 修掉的那个坑，`RawProbe-winexe.exe` 是它的最小复现。
 | `AudioTest.exe` | `AudioTest.exe 45` | 循环播放系统 WAV 45 秒，制造真实音频会话，用来测“播放时推迟关屏”。 |
 | `PlaySound.exe` | `PlaySound.exe <wav>` | 播一个短 WAV。 |
 | `SuspendTest.exe` | `SuspendTest.exe <log> [wakeSeconds]` | 打印进程令牌里的 `SeShutdownPrivilege` 属性，arm 一个 `fResume` 唤醒计时器，然后 `SetSuspendState`。**必须按 BOOLEAN 封送**（`byte` 返回），否则失败也会显示成功。用它对照计划任务 / 普通进程 / WMI 三种上下文。 |
+| `MonitorPower.exe` | `MonitorPower.exe list`（= `get`）<br>`MonitorPower.exe off [--hard]`<br>`MonitorPower.exe on`<br>`MonitorPower.exe watch 30` | DDC/CI 面板电源（MCCS VCP `0xD6`：1=on / 2=standby / 3=suspend / 4=off / 5=hard off）。`list` 打印每个物理显示器的当前值；`watch` 每秒采样、变化才打印。用它区分“真关屏”（`power=standby` 并保持）和“只是 Windows 停了输出”（VCP 仍是 `power=on`，一有输入就亮）。`unreadable (err ...)` 表示该显示器 OSD 关了 DDC/CI 或中间有转接器。 |
 | `wmi-launch-test.ps1` | `wmi-launch-test.ps1` | 示范用 WMI 创建进程并拿令牌权限。 |
 
 ## 观察类脚本

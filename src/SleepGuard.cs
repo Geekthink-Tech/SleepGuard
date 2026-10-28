@@ -16,6 +16,7 @@
 //   --phantom <s1,s2> device-name substrings to ignore            (default VID_1D6B&PID_0122)
 //   --wake    <sec>   SELF-TEST ONLY: arm a resume timer before suspending
 //   --log     <path>  log file path
+//   --no-ddc          do not use DDC/CI panel power; only SC_MONITORPOWER
 //   --once            log the resolved configuration and keep running (default)
 
 using System;
@@ -84,6 +85,10 @@ internal static class SleepGuard
     private static long rawEvents;           // diagnostics: how many WM_INPUT messages we received
     private static bool inputSinceSuspend;
     private static IntPtr hibTimer = IntPtr.Zero;
+
+    private static bool ddcEnabled = true;   // --no-ddc disables DDC/CI panel power control
+    private static bool ddcUnavailable;      // no monitor accepted a DDC write on this box
+    private static bool panelDark;           // we asked the panels to go into DPMS standby
 
     // Real-input detection. Raw input and low-level hooks proved unreliable for
     // this process (installed fine, never fired - even in the interactive
@@ -367,11 +372,104 @@ internal static class SleepGuard
         return false;
     }
 
+    // SC_MONITORPOWER only asks Windows to blank its output. Any input event then
+    // lights the panel right back up - and this machine has a HID device that fires
+    // ~3 reports per second (the HiMOS water-cooler screen), so the OS-level blank
+    // was undone almost instantly: the screen went black and came back on a moment
+    // later, over and over. A DDC/CI DPMS-off (MCCS VCP 0xD6) is handled by the
+    // monitor itself and is immune to input events, so the panel really stays dark
+    // until a real user comes back.
+    private const byte VCP_POWER = 0xD6;   // 1 = on, 2 = standby, 3 = suspend, 4 = off
+    private const uint DPMS_ON = 1;
+    private const uint DPMS_OFF = 4;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct PHYSICAL_MONITOR
+    {
+        public IntPtr hPhysicalMonitor;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string szPhysicalMonitorDescription;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITOR_RECT { public int left, top, right, bottom; }
+
+    private delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref MONITOR_RECT lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    private static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, out uint count);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    private static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, uint count, [Out] PHYSICAL_MONITOR[] monitors);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    private static extern bool SetVCPFeature(IntPtr hPhysicalMonitor, byte code, uint value);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    private static extern bool DestroyPhysicalMonitors(uint count, [In] PHYSICAL_MONITOR[] monitors);
+
     private static void TurnOffMonitors()
     {
         IntPtr result;
         SendMessageTimeoutW((IntPtr)HWND_BROADCAST, (uint)WM_SYSCOMMAND, (IntPtr)SC_MONITORPOWER,
             (IntPtr)2, SMTO_ABORTIFHUNG, 1500, out result);
+        QueueMonitorPower(false);
+    }
+
+    // Called when real input arrives: the OS brings its own blank back, but a panel
+    // that is in DDC standby has to be asked explicitly.
+    private static void WakeMonitors()
+    {
+        panelDark = false;
+        IntPtr result;
+        SendMessageTimeoutW((IntPtr)HWND_BROADCAST, (uint)WM_SYSCOMMAND, (IntPtr)SC_MONITORPOWER,
+            (IntPtr)(-1), SMTO_ABORTIFHUNG, 1500, out result);
+        QueueMonitorPower(true);
+        TryLog("monitors woken on real input (ddc)");
+    }
+
+    private static void QueueMonitorPower(bool on)
+    {
+        if (!ddcEnabled || ddcUnavailable) return;
+        if (!on) panelDark = true;
+        ThreadPool.QueueUserWorkItem(delegate { ApplyMonitorPower(on); });
+    }
+
+    // Runs off the message loop: a DDC write costs tens of milliseconds per monitor.
+    private static void ApplyMonitorPower(bool on)
+    {
+        if (!ddcEnabled || ddcUnavailable) return;
+        try
+        {
+            int touched = 0, failed = 0;
+            MonitorEnumProc cb = delegate(IntPtr hMon, IntPtr hdc, ref MONITOR_RECT rc, IntPtr data)
+            {
+                uint count;
+                if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, out count) || count == 0) return true;
+                PHYSICAL_MONITOR[] arr = new PHYSICAL_MONITOR[count];
+                if (!GetPhysicalMonitorsFromHMONITOR(hMon, count, arr)) return true;
+                try
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (SetVCPFeature(arr[i].hPhysicalMonitor, VCP_POWER, on ? DPMS_ON : DPMS_OFF)) touched++;
+                        else failed++;
+                    }
+                }
+                finally { DestroyPhysicalMonitors(count, arr); }
+                return true;
+            };
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
+            if (touched == 0)
+            {
+                if (failed > 0) ddcUnavailable = true;
+                TryLog("ddc: no monitor accepted power=" + (on ? "on" : "off") + " (failed=" + failed + ")");
+            }
+        }
+        catch (Exception ex) { TryLog("ddc error: " + ex.Message); }
     }
 
     // ---- audio / video playback detection --------------------------------
@@ -714,6 +812,7 @@ internal static class SleepGuard
 
         lastRealMs = clock.ElapsedMilliseconds;
         displayOff = false;
+        if (panelDark) WakeMonitors();   // DDC standby survives an S3 cycle
         return true;
     }
 
@@ -818,6 +917,11 @@ internal static class SleepGuard
             TryLog("real input detected (" + source + ") -> idle clock reset, display considered awake");
             displayOff = false;
         }
+
+        // A panel in DDC standby does not come back on its own for a key press or a
+        // wheel click: the OS only lights the display for input it turns into
+        // activity, and we blanked the monitor behind its back.
+        if (panelDark) WakeMonitors();
     }
 
     // Cursor movement is a real user action; the phantom HID never moves the
@@ -1013,6 +1117,8 @@ internal static class SleepGuard
                     logPath = v; i++; break;
                 case "--audio-debug":
                     audioDebug = true; break;
+                case "--no-ddc":
+                    ddcEnabled = false; break;
                 default:
                     Log("unknown argument ignored: " + a);
                     break;
@@ -1046,6 +1152,7 @@ internal static class SleepGuard
         AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
         {
             TryLog("UNHANDLED EXCEPTION: " + e.ExceptionObject);
+            ApplyMonitorPower(true);   // never leave the panels dark behind a dead guard
         };
 
         bool isNew;
@@ -1068,6 +1175,8 @@ internal static class SleepGuard
             string.Join(",", phantomNames) + "] phantom-audio=[" +
             string.Join(",", phantomAudioNames) + "] log=" + logPath);
         Log("SeShutdownPrivilege enabled=" + EnableShutdownPrivilege());
+        Log("monitor power control: ddc=" + ddcEnabled);
+        if (ddcEnabled) ApplyMonitorPower(true);   // a previous run may have died with the panels dark
 
         string className = "SleepGuardWindowClass";
         wndProcKeepAlive = new WndProcDelegate(WndProc);
@@ -1161,7 +1270,7 @@ internal static class SleepGuard
         lastRealMs = clock.ElapsedMilliseconds;
         lastAudioMs = WallMs();
         displayOff = false;
-        Log("ready v1.1.2 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored");
+        Log("ready v1.1.3 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; ddc=" + ddcEnabled);
 
         MSG msg;
         int gm;
@@ -1173,6 +1282,7 @@ internal static class SleepGuard
         if (gm == -1) TryLog("GetMessageW failed, err=" + Marshal.GetLastWin32Error());
 
         Log("message loop ended; exiting");
+        ApplyMonitorPower(true);   // never leave the panels dark behind a dead guard
         if (instanceMutex != null) instanceMutex.ReleaseMutex();
         return 0;
     }

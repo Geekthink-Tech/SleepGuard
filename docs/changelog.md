@@ -2,6 +2,24 @@
 
 时间均为 2026 年 10 月，机器为本仓库的开发机（Windows 11 build 26300，双显示器，水冷屏 HID，网易UU远程）。
 
+## v1.1.3 — 2026-10-28
+
+修“息屏后马上自动亮”。
+
+- 根因：`SC_MONITORPOWER` 只让 Windows 停止输出画面，任何输入事件（包括水冷屏 HID 每秒 ~3 次的
+  consumer-control 报文）都会把它重新点亮。用户看到的就是“黑一下又亮、每 45 秒重复一次”。
+- 改为 **DDC/CI 硬件 standby**（MCCS VCP `0xD6`：1=on / 2=standby / 3=suspend / 4=off），
+  由显示器自己保持，输入事件无法把它叫醒：
+  - 关屏：`SC_MONITORPOWER(2)` + 所有物理显示器 `SetVCPFeature(0xD6, 4)`（工作线程执行，不阻塞消息循环）；
+  - 唤醒：真实输入、从 S3 恢复、崩溃/退出路径都会 `SetVCPFeature(0xD6, 1)`，保证屏不会留在暗着；
+  - `--no-ddc` 可退回纯 `SC_MONITORPOWER`；显示器 OSD 关闭 DDC/CI 时读取失败（`power=unreadable`），
+    自动降级不影响睡眠逻辑。
+- 新增 `tools\MonitorPower.cs`（`list` / `off [--hard]` / `on` / `watch <sec>`）与
+  `tests\run-monitor-test.ps1`（要求：关屏后 panel 真进入 standby 并保持 ≥6 s，真实输入后回到 on）。
+
+实测（2026-10-28 22:53）：15 s 触发关屏 → `power=standby` 保持 6 s（期间幻影 HID 持续发报文）→
+注入真实鼠标 → 日志 `monitors woken on real input (ddc)` → `power=on`。
+
 ## v1.1.2 — 2026-10-28
 
 三个会导致“用户在用电脑却被熄屏/睡眠/黑屏”的真 BUG 一起修掉，这是本项目的转折点。

@@ -7,7 +7,8 @@
 | 现象 | 真正原因 | 处理 |
 |---|---|---|
 | 人离开后屏幕一直亮、电脑从不睡眠 | 多个 SYSTEM 电源请求常驻：GameViewer（网易UU远程）`PreventSleep=1`、AMD HDMI 音频活动流；同时水冷屏 HID 每 25 秒往系统灌 72 个输入事件，把空闲计时器一直刷新 | 关掉 GameViewer 的“防止睡眠”、退出不用的音频播放；用 SleepGuard 的幻影设备过滤（`--phantom "VID_1D6B&PID_0122"`） |
-| 屏幕关了又自己亮，反复闪烁 | 水冷屏 HID（consumer control）会触发显示器重新上电；守护原本“关屏一次就锁存” | v1.0.4 起每 45 s 重发 `SC_MONITORPOWER`，直到出现真实输入 |
+| 屏幕关了又自己亮，反复闪烁 | 水冷屏 HID（consumer control）会触发显示器重新上电；`SC_MONITORPOWER` 只停止 Windows 输出画面，任何输入事件都会把它重新点亮 | v1.0.4 起每 45 s 重发；v1.1.3 起改用 **DDC/CI 硬件 standby**（VCP `0xD6`），显示器自己保持，输入叫不醒，真实输入时才 `SetVCPFeature(0xD6, 1)` 唤醒。验证：`tools\MonitorPower.exe list` 应为 `power=standby` |
+| 关屏后显示器立刻又亮，且 `tools\MonitorPower.exe list` 显示 `power=unreadable` | 显示器 OSD 关闭了 DDC/CI，或中间接了转接器/采集卡/KVM | 在显示器 OSD 里打开 DDC/CI；确实不支持时守护会自动降级为纯 `SC_MONITORPOWER`，也可显式 `--no-ddc` |
 | 明明在打字，屏幕却黑了 | 守护只看到光标变化：键盘/按键/滚轮全部漏检（旧版只靠 `GetCursorPos` + 低层钩子，而钩子在这台机器上装了不触发） | v1.1.2 起改用 raw input + 20 ms 轮询双通道，并用**控制台子系统**编译（见下条） |
 | 正在用电脑，屏幕突然黑掉而且再也点不亮 | `WM_INPUT` 的 `lParam` 被当成 `RAWINPUTHEADER*` 解引用（它其实是 `HRAWINPUT` 句柄）→ 原生层 `0xC0000005`（WER：`VCRUNTIME140_CLR0400.dll`，偏移 `0x1416`）。崩溃往往正好发生在关屏之后 | v1.1.1 修：`GetRawInputData` 两次调用（取长度 → 拷进 `AllocHGlobal`）再解析 |
 | 进程是 GUI 子系统时，raw input 一条都收不到 | 本机实测：同一份代码 `/target:winexe` 收 0 条，`/target:exe` 正常；连运行时 `AllocConsole()` 也救不回来 | v1.1.2 起守护用 `/target:exe` 编译，`Main` 开头把控制台窗口隐藏 |

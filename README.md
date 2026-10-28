@@ -130,6 +130,7 @@ docs\                     testing.md, troubleshooting.md, changelog.md, case-stu
 ```powershell
 .\tests\run-full-selftest.ps1          # build + input + monitor-off (never sleeps)
 .\tests\run-full-selftest.ps1 -Force   # also suspend/resume: the machine really sleeps
+.\tests\run-monitor-test.ps1           # panel really stays dark, real input wakes it (DDC/CI)
 ```
 
 Each stage stops the production guard, starts a throw-away one with short thresholds, checks the
@@ -152,7 +153,14 @@ Quick manual smoke test (does not install anything):
 2. A 1 s timer tick compares the clock against the thresholds. The clock uses `DateTime.UtcNow`
    (wall clock), because `Stopwatch`/QPC may not advance across S3/S4 — that is also how the
    process knows whether it really slept when it resumes.
-3. Monitor off: `SendMessageTimeout(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)`.
+3. Monitor off: `SendMessageTimeout(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)` **plus** a
+   DDC/CI DPMS-off (`MCCS VCP 0xD6 = 4`) on every physical monitor. The `SC_MONITORPOWER` blank
+   alone is undone by the next input event — and the phantom HID fires ~3 reports/s — so the panel
+   lit up again a moment after going dark. DDC standby is handled by the monitor itself and stays
+   until the guard asks for `DPMS on` (which happens on the next real input, after resume from
+   sleep, and from the crash/exit paths so the screen can never be left dark). `--no-ddc` falls
+   back to the OS-only behaviour; monitors with DDC/CI disabled in their OSD report
+   `power=unreadable` and are simply left to `SC_MONITORPOWER`.
 4. Suspend: `SetSuspendState(FALSE, FALSE, FALSE)` after enabling `SeShutdownPrivilege`.
    `SetSuspendState` can silently return success while nothing happens (a power request blocked
    it), so SleepGuard measures how long the call took and retries every 30 s if it returned in
@@ -167,7 +175,7 @@ Quick manual smoke test (does not install anything):
 
 ## Gotchas that cost the most time
 
-Full write-ups with evidence: [docs/troubleshooting.md](docs/troubleshooting.md). The four that
+Full write-ups with evidence: [docs/troubleshooting.md](docs/troubleshooting.md). The five that
 matter if you are adapting this code:
 
 1. **`WM_INPUT` lParam is an `HRAWINPUT` handle, not a `RAWINPUTHEADER*`.** Dereferencing it kills
@@ -183,6 +191,12 @@ matter if you are adapting this code:
    received zero raw-input events for mouse/keyboard while byte-identical `/target:exe` code
    received everything (same session, desktop, elevation, registrations). `AllocConsole()` did not
    help. The guard hides its console via `ShowWindow(GetConsoleWindow(), SW_HIDE)`.
+5. **`SC_MONITORPOWER` blanks the output, it does not power the panel down.** Any input event
+   relights it — including the phantom HID of the very device this tool exists for — which looks
+   like "the screen goes dark and comes back on immediately" and repeats every retry. Only DDC/CI
+   standby (VCP `0xD6`) holds. Verified with `tools/MonitorPower.cs`: `list` shows
+   `power=standby` that survives minutes of phantom reports, whereas after `SC_MONITORPOWER` the
+   VCP state still reads `power=on`.
 
 ## Limitations
 

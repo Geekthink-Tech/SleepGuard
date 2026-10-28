@@ -155,3 +155,30 @@ Lessons:
 - A watchdog that dies silently is worse than no watchdog. Enable restart-on-failure and check
   `Get-ScheduledTaskInfo` after the first hour of real use.
 - Exercise long-running P/Invoke code for minutes, not seconds, before trusting it.
+
+## Postmortem: "the screen turns off and immediately back on"
+
+Once the clock was right, the panel went dark — and lit up again a second later, every 45 s, exactly
+whenever the retry fired. The log said the monitors had been turned off, so the guard was not lying:
+
+```text
+22:40:55.912  IDLE 301s >= display threshold 300s -> turning monitors off
+22:41:40.916  IDLE 346s and still no real input -> turning monitors off again
+22:42:26.003  IDLE 392s and still no real input -> turning monitors off again
+```
+
+`SendMessageTimeout(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)` only stops the Windows
+output; it does not power the panel down, and **any input event relights it** — including the phantom
+HID this whole project exists for, which fires ~3 reports/s. Measured with `tools/MonitorPower.cs`
+(DDC/CI VCP `0xD6`):
+
+| action | log/first read | 10 s later |
+|---|---|---|
+| `SC_MONITORPOWER` off | VCP still `power=on` | `power=on` (blank is purely a Windows-output state) |
+| DDC `SetVCPFeature(0xD6, 4)` | `power=standby` | `power=standby`, surviving the phantom reports |
+
+Fix (v1.1.3): ask the monitor itself — DDC/CI DPMS standby — and keep the OS blank as a fallback.
+Wake the panels from the guard when real input arrives, after resuming from S3, and from the
+crash/exit paths, so a dead or confused guard can never leave the screen dark. Regression test:
+`tests/run-monitor-test.ps1` (`power=standby` must hold for 6 s, real input must bring it to
+`power=on`).
