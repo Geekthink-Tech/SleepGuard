@@ -15,3 +15,4 @@ sleep-monitor-log.txt
 .vs/
 *.user
 *.suo
+launcher.log

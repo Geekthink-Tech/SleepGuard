@@ -74,10 +74,12 @@ internal static class SleepGuard
     private static bool displayPostponed;   // audio/video is playing -> display-off deferred
     private static long lastAudioMs;        // wall ms of the last tick that saw real audio
     private const int AudioGraceMs = 10000; // keep the display on this long after the last sound
+    private const int DisplayRetryMs = 45000; // re-assert monitor-off at most this often while idle
     private static bool audioWasPlaying;    // for start/stop transition logging
     private static bool audioDebug;         // --audio-debug: heartbeat + every sample in the log
     private static long lastHeartbeatMs;
     private static long nextSleepRetryMs;
+    private static long nextDisplayRetryMs;  // re-send monitor-off if a phantom input turned it back on
     private static bool inputSinceSuspend;
     private static IntPtr hibTimer = IntPtr.Zero;
 
@@ -695,6 +697,17 @@ internal static class SleepGuard
             TurnOffMonitors();
             displayOff = true;
             displayPostponed = false;
+            nextDisplayRetryMs = now + DisplayRetryMs;
+        }
+        else if (displaySec > 0 && idle >= displaySec && displayOff && now >= nextDisplayRetryMs &&
+                 WallMs() - lastAudioMs >= AudioGraceMs)
+        {
+            // The phantom HID can bring the panel back up even though nobody is
+            // here. Keep insisting (bounded interval) until real input arrives.
+            Log(string.Format(CultureInfo.InvariantCulture,
+                "IDLE {0:F0}s and still no real input -> turning monitors off again", idle));
+            TurnOffMonitors();
+            nextDisplayRetryMs = now + DisplayRetryMs;
         }
     }
 

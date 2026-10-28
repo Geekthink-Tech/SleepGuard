@@ -62,8 +62,18 @@ $argument = "--display $Display --sleep $Sleep --hibernate $Hibernate --phantom 
 Get-Process SleepGuard -ErrorAction SilentlyContinue | Stop-Process -Force
 Unregister-ScheduledTask -TaskName 'SleepGuard' -Confirm:$false -ErrorAction SilentlyContinue
 
+# The task starts the LAUNCHER, not SleepGuard.exe directly. A process started by
+# Task Scheduler gets a token whose SeShutdownPrivilege cannot be enabled from
+# inside (AdjustTokenPrivileges "succeeds", the attr stays 0x0, SetSuspendState
+# then fails with 1314), so the guard would never be able to sleep the machine.
+# launch-sleepguard.ps1 asks WMI to create the guard instead: that child has the
+# privilege enabled and suspend works. See README "Task Scheduler steals the
+# shutdown privilege".
+$launcher = Join-Path $root 'launch-sleepguard.ps1'
 $user      = "$env:USERDOMAIN\$env:USERNAME"
-$action    = New-ScheduledTaskAction -Execute $exe -Argument $argument -WorkingDirectory (Split-Path $exe)
+$action    = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
+                -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`" -Display $Display -Sleep $Sleep -Hibernate $Hibernate -Phantom `"$Phantom`"" `
+                -WorkingDirectory $root
 $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet `
@@ -74,7 +84,7 @@ $settings  = New-ScheduledTaskSettingsSet `
 
 Register-ScheduledTask -TaskName 'SleepGuard' -Action $action -Trigger $trigger -Principal $principal `
     -Settings $settings -Force `
-    -Description 'Phantom-input aware idle watchdog: monitor off / suspend / hibernate on a real-input clock.' | Out-Null
+    -Description 'Phantom-input aware idle watchdog: monitor off / suspend / hibernate on a real-input clock (launched via WMI so the shutdown privilege is usable).' | Out-Null
 
 Start-ScheduledTask -TaskName 'SleepGuard'
 Start-Sleep -Seconds 2
