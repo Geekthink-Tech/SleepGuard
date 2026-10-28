@@ -1,14 +1,17 @@
 # SleepGuard
 
-**A "phantom-input aware" idle watchdog for Windows.** It turns the monitor off, suspends and
+**A phantom-input aware idle watchdog for Windows.** It turns the monitor off, suspends and
 hibernates on a *real* user-idle clock, ignoring HID devices that keep spamming input reports.
 
-No SDK required 鈥?it is a single C# file compiled with the `csc.exe` that ships with every
+No SDK required — it is a single C# file compiled with the `csc.exe` that ships with every
 Windows 10/11 installation.
 
 ```
-绂诲紑 5 鍒嗛挓 鈫?鍏虫樉绀哄櫒锛堟湁闊宠棰戝湪鏀惧垯鎺ㄨ繜锛?鈫?10 鍒嗛挓 鈫?鐫＄湢 S3 鈫?30 鍒嗛挓 鈫?浼戠湢 S4
+离开 5 分钟 → 关显示器（有音视频在放则推迟）→ 10 分钟 → 睡眠 S3 → 30 分钟 → 休眠 S4
 ```
+
+Status: **v1.1.2**, verified 2026-10-28 on Windows 11 build 26300 (x64, .NET Framework 4.8):
+monitor off at 15 s, S3 at 20 s, self-wake after ~65 s, idle clock reset, process alive throughout.
 
 ---
 
@@ -22,8 +25,8 @@ anything:
 - macro pads, KVM switches, virtual HID emulators (`VID_1D6B` = Linux Foundation virtual HID),
 - some vendor utilities that "keep the device alive" through a virtual consumer-control device.
 
-Windows counts **every** of those reports as user activity. `GetLastInputInfo()` therefore never
-ages, and the built-in timers (screen off, sleep, hibernate) **never fire** 鈥?the monitor stays on
+Windows counts **every** one of those reports as user activity. `GetLastInputInfo()` therefore never
+ages, and the built-in timers (screen off, sleep, hibernate) **never fire** — the monitor stays on
 all night and the PC never sleeps, no matter what you configure in Power Options.
 
 `powercfg /requests` does **not** show this: it is input activity, not a power request. That is why
@@ -33,23 +36,23 @@ SleepGuard solves it by keeping its own idle clock:
 
 | Signal | Counted as real input? |
 |---|---|
-| Mouse / keyboard / pen / touch / precision touchpad raw input from a normal device | 鉁?yes, resets the clock |
-| Raw input from a device whose name matches a phantom pattern (default `VID_1D6B&PID_0122`) | 鉂?ignored |
-| Anything else (vendor HID, sensor, consumer control) | 鉂?ignored 鈥?it never reaches `WM_INPUT` as mouse/keyboard |
-| Audio / video currently playing | 鈴?monitor-off is postponed (sleep/hibernate still happen) |
+| Mouse / keyboard / pen / touch / precision touchpad raw input from a normal device | yes, resets the clock |
+| Raw input from a device whose name matches a phantom pattern (default `VID_1D6B&PID_0122`) | no — ignored |
+| Anything else (vendor HID, sensor, consumer control) | no — it never reaches `WM_INPUT` as mouse/keyboard |
+| Audio / video currently playing | monitor-off is postponed (sleep/hibernate still happen) |
 
 ## Behaviour
 
 | Real idle | Action | Notes |
 |---|---|---|
-| 鈮?`--display` (default 300 s) | Turn the monitor off (`SC_MONITORPOWER`) | Postponed while audio/video is playing |
-| 鈮?`--sleep` (default 600 s) | Suspend to RAM (S3) | Any real input wakes it instantly |
-| 鈮?`--hibernate` (default 1800 s) | Total idle 鈫?hibernate (S4) | Implemented as *sleep first, then hibernate*: a resume timer wakes the machine at `--hibernate` and it hibernates |
+| ≥ `--display` (default 300 s) | Turn the monitor off (`SC_MONITORPOWER`) | Postponed while audio/video is playing; re-sent every 45 s while still idle |
+| ≥ `--sleep` (default 600 s) | Suspend to RAM (S3) | Any real input wakes it instantly |
+| ≥ `--hibernate` (default 1800 s) | Hibernate (S4) | Implemented as *sleep first, then hibernate*: a resume timer wakes the machine at `--hibernate` and it hibernates |
 | any time | Real keyboard/mouse | Clock resets, display wakes |
 
 Audio playing does **not** stop sleep/hibernate by design (music alone should not keep the PC
-awake). Only the monitor-off step is postponed 鈥?this is the "watching a video / listening to a
-podcast, screen would otherwise go black" exception.
+awake). Only the monitor-off step is postponed — the "watching a video / listening to a podcast,
+the screen would otherwise go black" exception.
 
 ## Quick start
 
@@ -63,7 +66,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
 `install.ps1` builds if needed, registers the scheduled task `SleepGuard` (at logon, interactive
-session, highest privileges, no time limit, restart on failure) and starts it.
+session, highest privileges, no time limit, restart on failure) and starts it through
+`launch-sleepguard.ps1` — the launcher re-creates the guard via WMI, which is required for
+`SetSuspendState` to work (see *Gotchas* below).
 
 Log file: `%LOCALAPPDATA%\SleepGuard\sleep-guard.log`
 
@@ -79,129 +84,124 @@ Get-Content "$env:LOCALAPPDATA\SleepGuard\sleep-guard.log" -Tail 30
 | `--sleep <sec>` | `600` | Suspend to RAM after N seconds of real idle (`0` = never) |
 | `--hibernate <sec>` | `0` | Hibernate after N seconds of **total** idle; must be `> --sleep` (`0` = never) |
 | `--phantom <a,b>` | `VID_1D6B&PID_0122` | Comma-separated device-name substrings to ignore (case-insensitive, matches anywhere in the raw-input device name) |
-| `--phantom-audio <a,b>` | `缃戞槗UU杩滅▼,UU杩滅▼` | Comma-separated **audio-session display names** that must not count as "media is playing" (see below) |
-| `--audio-debug` | off | Log every audio session state and a 30 s heartbeat (noisy; for diagnosis only) |
+| `--phantom-audio <a,b>` | `网易UU远程,UU远程` | Comma-separated **audio-session display names** that must not count as "media is playing" |
+| `--audio-debug` | off | Log every audio session state and a 30 s heartbeat (noisy; diagnosis only) |
 | `--log <path>` | `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` | Log file (rotated to `.old` at 1 MB) |
-| `--wake <sec>` | `0` | **Self-test only**: arm a resume timer before suspending so the machine wakes itself |
-| `--hib-wake <sec>` | `0` | **Self-test only**: same for the hibernate step |
+| `--wake <sec>` | `0` | **Test only**: arm a resume timer before suspending so the machine wakes itself |
+| `--hib-wake <sec>` | `0` | **Test only**: same for the hibernate step |
 
-## Self-tests (they really sleep the machine 鈥?pass the wake argument!)
+## Project layout
+
+```
+build.ps1                 builds src\SleepGuard.cs -> dist\SleepGuard.exe  (/target:exe, see gotchas)
+install.ps1               registers + starts the logon task (elevated)
+uninstall.ps1             removes the task / files
+launch-sleepguard.ps1     task action: re-creates the guard through WMI so it can suspend
+
+src\SleepGuard.cs         the watchdog (single file, no dependencies)
+dist\                     build output (dist\tools\ for the probes)
+
+tools\                    standalone diagnostic probes + build-tools.ps1 + README.md
+  RawProbe.cs             raw-input counters per device / per usage
+  KeyProbe.cs             GetAsyncKeyState polling, per launch context
+  HookProbe.cs            low-level hook delivery test
+  AllocProbe.cs           does AllocConsole() rescue raw input in a winexe build
+  SendMove.cs             injects absolute cursor moves
+  AudioSessions.cs        dumps CoreAudio sessions per endpoint
+  AudioTest.cs            loops a system WAV so a real audio session exists
+  PlaySound.cs            plays one short WAV
+  SuspendTest.cs          token privileges + SetSuspendState, the task-vs-WMI experiment
+  inject-*.ps1            input injection helpers
+  quiet-probe.ps1         one-off "who is refreshing the idle timer" probe
+  sleep-watch.ps1         long sampler (idle, cursor, power requests)
+
+tests\                    reproducible end-to-end scripts + README.md
+  _common.ps1             helpers: stop/restore production guard, start test guard via WMI
+  run-input-test.ps1      injected input must reset the idle clock   (safe)
+  run-display-test.ps1    monitor really goes dark                  (screen flashes)
+  run-sleep-test.ps1      real S3 + self wake                        (-Force, machine sleeps)
+  run-full-selftest.ps1   build + the three stages, PASS/FAIL summary
+
+docs\                     testing.md, troubleshooting.md, changelog.md, case-study.md, ci-workflow.yml
+```
+
+## Testing
 
 ```powershell
-# 15 s of real idle -> monitor off; 20 s -> S3; wake itself after 30 s
-.\dist\SleepGuard.exe --display 15 --sleep 20 --wake 30 --log .\selftest.log
-
-# full chain: monitor off 5 s, S3 at 15 s, hibernate at 40 s, wake from hibernation after 30 s
-.\dist\SleepGuard.exe --display 5 --sleep 15 --hibernate 40 --hib-wake 30 --log .\selftest.log
+.\tests\run-full-selftest.ps1          # build + input + monitor-off (never sleeps)
+.\tests\run-full-selftest.ps1 -Force   # also suspend/resume: the machine really sleeps
 ```
 
-Verify with the event log:
+Each stage stops the production guard, starts a throw-away one with short thresholds, checks the
+log (and Kernel-Power events for the suspend stage), then restores the production guard. Details,
+expected timings and failure triage: [docs/testing.md](docs/testing.md). Repro commands for the
+individual tools: [tools/README.md](tools/README.md).
+
+Quick manual smoke test (does not install anything):
 
 ```powershell
-Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=42,107,187,131} -MaxEvents 10 |
-  Select-Object TimeCreated, Id, @{n='msg';e={($_.Message -split "`n")[0]}}
-powercfg /lastwake
-(Get-Item C:\hiberfil.sys).LastWriteTime   # hibernate really wrote the hiberfile
+.\dist\SleepGuard.exe --display 15 --sleep 0 --hibernate 0 --audio-debug --log .\selftest.log
+# screen goes dark after ~15 s; Ctrl+C / any input to stop
 ```
-
-## Test the audio/video exception
-
-```powershell
-.\dist\AudioTest.exe 45          # loops a system WAV for 45 s (creates a real audio session)
-```
-
-Watch the log: `audio/video is playing -> display-off postponed` while it plays, then
-`turning monitors off` right after the audio stops (within one tick, 鈮?1 s).
-
-### Beware of "phantom" audio sessions
-
-Some remote-desktop / streaming tools (缃戞槗UU杩滅▼ on the development machine) keep an audio
-session in `AudioSessionStateActive` **permanently**, even with nothing audible. Counting it would
-keep the display on forever 鈥?the same class of bug as a phantom HID device, just at the audio layer.
-
-If your log repeats `display-off postponed` while nothing is playing, run with `--audio-debug` and
-look at the session list:
-
-```
-audio-debug: session[1] state=1 name=缃戞槗UU杩滅▼ -> ignored (phantom)
-audio-debug: playing=False
-```
-
-Add the offending display name to `--phantom-audio` (default already covers 缃戞槗UU杩滅▼ / UU杩滅▼).
-The engine binary build `SleepGuard.exe --audio-debug --display 15` is the quickest way to check.
 
 ## How it works (short version)
 
-1. Hidden message-only window + `RegisterRawInputDevices(..., RIDEV_INPUTSINK)` for mouse,
-   keyboard, pen, touch and precision touchpad. `WM_INPUT` carries the device name; matching the
-   phantom list marks the event as "not real". Only real events reset the clock.
+1. Hidden window + `RegisterRawInputDevices(..., RIDEV_INPUTSINK)` for mouse, keyboard, pen, touch
+   and precision touchpad. `WM_INPUT` carries the device name; a device matching `--phantom` is
+   ignored. Only real events reset the clock. A 20 ms `GetCursorPos` poll is the second channel.
 2. A 1 s timer tick compares the clock against the thresholds. The clock uses `DateTime.UtcNow`
-   (wall clock), because `Stopwatch`/QPC may not advance across S3/S4 鈥?that also tells the process
-   whether it really slept when it resumes.
+   (wall clock), because `Stopwatch`/QPC may not advance across S3/S4 — that is also how the
+   process knows whether it really slept when it resumes.
 3. Monitor off: `SendMessageTimeout(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)`.
 4. Suspend: `SetSuspendState(FALSE, FALSE, FALSE)` after enabling `SeShutdownPrivilege`.
    `SetSuspendState` can silently return success while nothing happens (a power request blocked
-   it); SleepGuard measures how long the call took and retries every 30 s if it returned in < 2 s
-   without sleeping.
+   it), so SleepGuard measures how long the call took and retries every 30 s if it returned in
+   under 2 s without sleeping.
 5. Hibernate chain: before suspending it arms a waitable timer for `--hibernate - --sleep` seconds
    with `fResume = TRUE`. The machine wakes, sees the elapsed wall time has reached the total idle
-   target and calls `SetSuspendState(TRUE, ...)`. If real input arrived in the meantime, the
-   hibernate step is cancelled.
+   target and calls `SetSuspendState(TRUE, ...)`. Real input in the meantime cancels the hibernate.
 6. Audio exception: CoreAudio `IAudioSessionManager2` session enumeration on the default render
-   endpoint; any `AudioSessionStateActive` session postpones monitor-off. Sessions whose display name
-   matches `--phantom-audio` are skipped, and the display comes back on the next tick after the last
-   real sound (10 s grace) 鈥?sleep/hibernate timing is untouched.
-7. Log lines are written to `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` (rotated at 1 MB).
+   endpoint; any `AudioSessionStateActive` session postpones monitor-off. Sessions whose display
+   name matches `--phantom-audio` are skipped. Sleep/hibernate timing is untouched.
+7. Log lines go to `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` (rotated at 1 MB).
 
-## If you only want a quick one-off diagnosis
+## Gotchas that cost the most time
 
-Before installing anything, run the probe 鈥?it tells you *which device* is refreshing the idle
-timer:
+Full write-ups with evidence: [docs/troubleshooting.md](docs/troubleshooting.md). The four that
+matter if you are adapting this code:
 
-```powershell
-powershell -ExecutionPolicy Bypass -Command "Invoke-Expression (Get-Content -Raw .\tools\quiet-probe.ps1)"
-Get-Content .\tools\quiet-probe-log.txt
-```
-
-It installs low-level hooks (to prove no synthetic input is injected) and registers every raw-input
-class (mouse, keyboard, gamepad, consumer control, pen, touch, precision touchpad), then prints the
-devices that produced events while you were not touching anything. Any device listed there with a
-steady stream (e.g. ~3 events/second) is your culprit 鈥?add it to `--phantom`.
-
-`tools/sleep-watch.ps1` is a longer monitor (15 min, 5 s samples) that writes idle/cursor deltas 鈥?handy to prove the problem exists before/after.
+1. **`WM_INPUT` lParam is an `HRAWINPUT` handle, not a `RAWINPUTHEADER*`.** Dereferencing it kills
+   the process with `0xC0000005` inside `VCRUNTIME140_CLR0400.dll` on the first event. Call
+   `GetRawInputData` twice (size, then copy) — as `tools/RawProbe.cs` does.
+2. **A task-started process cannot suspend the machine.** Its token has `SeShutdownPrivilege`
+   present but `0x0`; `AdjustTokenPrivileges` reports success and `SetSuspendState` still fails
+   with `err=1314`. The launch path must be `task -> launcher -> WMI Win32_Process.Create`
+   (token attribute `0x2`).
+3. **`BOOLEAN` returns must be marshalled as `byte`.** Declaring `SetSuspendState` as returning
+   `bool` reads the whole `EAX`; garbage in the upper bytes makes failures look like successes.
+4. **Build as `/target:exe`, not `/target:winexe`.** On the reference machine a winexe build
+   received zero raw-input events for mouse/keyboard while byte-identical `/target:exe` code
+   received everything (same session, desktop, elevation, registrations). `AllocConsole()` did not
+   help. The guard hides its console via `ShowWindow(GetConsoleWindow(), SW_HIDE)`.
 
 ## Limitations
 
 - Runs in the interactive desktop session only (that is where raw input and `SC_MONITORPOWER` live).
 - Some fullscreen-exclusive games ignore the monitor-off message. Sleep/hibernate still work.
 - Silent video (no audio stream) is **not** detected by the audio exception; only audio sessions.
-- A remote-desktop tool can keep a render session `Active` with nothing audible 鈥?add its display
-  name to `--phantom-audio` (缃戞槗UU杩滅▼ is pre-configured). Otherwise the display never turns off.
-- The hibernate resume timer may fire 30鈥?0 s late on some firmware. Harmless in normal use
-  (you wake it with the keyboard).
+- A remote-desktop tool can keep a render session `Active` with nothing audible — add its display
+  name to `--phantom-audio` (`网易UU远程` is pre-configured).
+- The hibernate resume timer may fire 30–40 s late on some firmware. Harmless in normal use.
 - Tested on Windows 11 (build 26300), x64, .NET Framework 4.8. Windows 10 should work; ARM64 is
   untested.
-- Suspend requires the process to run as administrator (`SeShutdownPrivilege`); monitor-off and
-  counting work without it.
+- Suspend requires administrator rights (`SeShutdownPrivilege`); monitor-off and idle counting work
+  without it.
 
-## Stability notes (v1.0.1)
+## If it ever dies
 
-v1.0.1 fixes a crash that showed up after ~5 minutes of normal use (the first version died silently,
-leaving you unprotected):
-
-- `GetRawInputDeviceInfo(RIDI_DEVICENAME)` can report a size that *excludes* the terminating NUL.
-  The buffer was allocated at exactly that size, so every raw-input event wrote two bytes past the
-  block. With a phantom HID firing ~3 events/s, the heap was corrupted within minutes and the
-  process died with `0xC0000005` inside `VCRUNTIME140_CLR0400.dll`.
-- Device-name resolution is now done once per device handle and cached, and `WM_INPUT` is forwarded
-  to `DefWindowProc` (required, otherwise the raw-input buffer is never freed).
-- Anything thrown inside the window procedure is caught and logged instead of killing the process,
-  and an `AppDomain.UnhandledException` hook records unexpected exceptions in the log.
-- The singleton mutex is kept in a static field so it cannot be collected early.
-
-If it ever dies again, check `Get-ScheduledTaskInfo SleepGuard` 鈥?`LastTaskResult` `3221225477`
-(`0xC0000005`) means an access violation; Event Viewer 鈫?Windows Logs 鈫?Application 鈫?"Application
-Error" names the faulting module. For a dump, enable local dumps once:
+`Get-ScheduledTaskInfo SleepGuard` → `LastTaskResult` `3221225477` (`0xC0000005`) means an access
+violation; Event Viewer → Windows Logs → Application → "Application Error" names the faulting
+module. For a dump, enable local dumps once:
 
 ```powershell
 $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\SleepGuard.exe'
@@ -213,76 +213,6 @@ New-ItemProperty $k -Name DumpType   -Value 1 -PropertyType DWord -Force | Out-N
 The registered task restarts the binary up to 3 times at 1-minute intervals, so a crash does not
 leave the machine unprotected for long.
 
-## Task Scheduler steals the shutdown privilege (v1.0.4)
-
-A process started **directly** by a scheduled task cannot suspend the machine. Measured on Windows 11
-build 26300 with an elevated task (`LogonType Interactive`, `RunLevel Highest`):
-
-| launch path | `SeShutdownPrivilege` in the token | `SetSuspendState` |
-|---|---|---|
-| Task Scheduler -> `SleepGuard.exe` | `0x0` (present, disabled) | `ret=0 err=1314` in 1 ms, machine stays awake |
-| WMI `Win32_Process.Create` -> `SleepGuard.exe` | `0x2` (enabled) | `ret=1`, machine really enters S3 |
-
-Inside the task process, `AdjustTokenPrivileges(SeShutdownPrivilege)` returns TRUE with
-`GetLastError() == 0`, yet the token attribute remains `0x0` 鈥?so the guard's own privilege-enable step
-"works" and the suspend call is still refused with `ERROR_PRIVILEGE_NOT_HELD` (`1314`). No
-`Kernel-Power` event 187 is written, which is how you can tell the call never reached the power
-manager. The very same binary launched through WMI gets the privilege enabled and suspends for real.
-
-Therefore the logon task runs `launch-sleepguard.ps1`, which creates the guard with
-`Invoke-CimMethod Win32_Process Create` and exits. Check `launcher.log` next to the scripts to see the
-WMI return code and the guard pid.
-
-To reproduce both cases, build `tools\SuspendTest.cs` (it arms a wake timer first, so a working
-suspend lasts a few seconds, then wakes itself) and start it once from a task and once through WMI:
-
-```powershell
-# task context: expect "returned ret=0 err=1314", machine never sleeps
-# WMI context:  expect "returned ret=1", machine sleeps and wakes itself
-```
-
-## v1.0.4: keep insisting on monitor-off
-
-The phantom HID can bring the panel back up after `SC_MONITORPOWER` was sent. The guard no longer
-assumes "off" is final: while nobody is here (`idle >= display` and no real input) it re-sends
-`SC_MONITORPOWER` every 45 s, and any real input cancels that until the next idle period.
-
-## v1.1.2: "it blanked my screen while I was typing"
-
-Three separate defects were found after the watchdog blanked the display of a user who was typing.
-All three are fixed in v1.1.2; the build is now `-target:exe` instead of `-target:winexe`.
-
-1. **`WM_INPUT` lParam misuse — crash with 0xC0000005.** `lParam` is an `HRAWINPUT` *handle*, not a
-   pointer to `RAWINPUTHEADER`. Calling `Marshal.PtrToStructure(lParam, …)` dereferenced invalid
-   memory and killed the process inside `VCRUNTIME140_CLR0400.dll` (error offset `0x1416`) right after
-   the first raw-input message. The monitor had already been blanked and no process was left alive to
-   restore it — from the outside that looks exactly like "the screen crashed". Fixed by calling
-   `GetRawInputData` twice (size query, then copy into an `AllocHGlobal` buffer), the same way
-   `tools/RawProbe.cs` does it.
-
-2. **`SetSuspendState` marshalling.** The prototype is
-   `BOOLEAN SetSuspendState(BOOLEAN hibernate, BOOLEAN forceCritical, BOOLEAN disableWakeEvent)`.
-   Declaring the return type as `bool` makes the CLR read the whole 32-bit `EAX`, whose upper bytes
-   are undefined: a failed call can look successful (`ok=True err=1314`) and a successful one can look
-   failed. Declare it `byte` and compare `!= 0`.
-
-3. **GUI-subsystem processes can receive no raw input at all.** On Windows 11 26300 a process compiled
-   `/target:winexe` received **zero** `WM_INPUT` for mouse and keyboard, while byte-identical code
-   compiled `/target:exe`, launched the same way (WMI), in the same session and desktop (WinSta0\
-   Default, both elevated) and registering the same five usage pairs, received every injected and real
-   event. `AllocConsole()` at runtime does not change the outcome. SleepGuard therefore ships as a
-   console-subsystem binary and hides its console immediately via
-   `ShowWindow(GetConsoleWindow(), SW_HIDE)` in `Main`. Reproduce with the bundled probe:
-
-   ```powershell
-   csc /target:exe    /out:probe-exe.exe    tools\RawProbe.cs
-   csc /target:winexe /out:probe-winexe.exe tools\RawProbe.cs
-   # inject input, then compare the two log files
-   ```
-
-Low-level hooks were removed in v1.1.x: they installed successfully (`mouse=True keyboard=True`) but
-never fired for this process, so the guard now relies on raw input plus a 20 ms `GetCursorPos` poll.
-
 ## Uninstall
 
 ```powershell
@@ -293,26 +223,35 @@ Remove-Item "$env:LOCALAPPDATA\SleepGuard" -Recurse -Force
 
 Or run `.\uninstall.ps1 -Purge`.
 
-> Note: after uninstalling you are back to the OS behaviour 鈥?and if a phantom HID device is still
-> present, that means the monitor stays on again. The two permanent alternatives are: disable the
-> offending device in Device Manager, or switch off the "prevent sleep / keep device alive" option
-> in the vendor app.
+> Note: after uninstalling you are back to the OS behaviour — and if a phantom HID device is still
+> present, the monitor stays on again. The two permanent alternatives are: disable the offending
+> device in Device Manager, or switch off the "prevent sleep / keep device alive" option in the
+> vendor app.
 
-## 涓枃閫熻
+## 中文速览
 
-**闂**锛氭煇浜?USB HID 璁惧锛堟按鍐峰睆鎺у埗鍣ㄣ€佷富鏉?鏄惧崱浠〃鐩樸€丷GB/椋庢墖鎺у埗鍣ㄣ€佸畯閿洏銆佽櫄鎷?HID 绛夛級
-姣忕涓婃姤鏁版杈撳叆鎶ュ憡锛學indows 璁や负"鐢ㄦ埛涓€鐩村湪鎿嶄綔"锛屽鑷淬€屽叧闂樉绀哄櫒 / 鐫＄湢 / 浼戠湢銆嶇殑璁℃椂鍣ㄦ案杩?鏃犳硶鍒版湡 鈥斺€?浜鸿蛋浜嗗睆骞曞交澶滀寒鐫€銆佺數鑴戜篃涓嶇潯銆俙powercfg /requests` 鐪嬩笉鍒板畠锛屽洜涓鸿繖涓嶆槸鐢垫簮璇锋眰銆?
-**瑙ｅ喅**锛歋leepGuard 鐢?Raw Input 鑷繁缁存姢"鐪熷疄杈撳叆鏃堕挓"锛屽彧璁ょ湡姝ｇ殑閿紶/绗?瑙︽帶浜嬩欢锛屾瘡涓┖闂?闃堝€煎埌浜嗗氨鎵ц锛? 鍒嗛挓鍏冲睆 鈫?10 鍒嗛挓鐫＄湢 S3 鈫?30 鍒嗛挓杞紤鐪?S4锛涙鍦ㄦ挱鏀鹃煶瑙嗛鏃跺彧鎺ㄨ繜鍏冲睆锛?涓嶅奖鍝嶇潯鐪?浼戠湢銆?
-**瀹夎**锛堢鐞嗗憳 PowerShell锛夛細
+**问题**：某些 USB HID 设备（水冷屏控制器、主板/显卡仪表盘、RGB/风扇控制器、宏键盘、虚拟 HID 等）
+每秒上报数次输入报告，Windows 认为"用户一直在操作"，导致「关闭显示器 / 睡眠 / 休眠」的计时器永远
+无法到期 —— 人走了屏幕彻夜亮着、电脑也不睡。`powercfg /requests` 看不到它，因为这不是电源请求。
+
+**解决**：SleepGuard 用 Raw Input 自己维护"真实输入时钟"，只认真正的键鼠/笔/触控事件，每个空闲
+阈值到了就执行：5 分钟关屏 → 10 分钟睡眠 S3 → 30 分钟转休眠 S4；正在播放音视频时只推迟关屏，
+不影响睡眠/休眠。
+
+**安装**（管理员 PowerShell）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 .\install.ps1 -Display 300 -Sleep 600 -Hibernate 1800
 ```
 
-**鏌ユ棩蹇?*锛歚Get-Content "$env:LOCALAPPDATA\SleepGuard\sleep-guard.log" -Tail 30`
+**查日志**：`Get-Content "$env:LOCALAPPDATA\SleepGuard\sleep-guard.log" -Tail 30`
 
-**鍏堣瘖鏂埌搴曟槸璋佸湪鎹ｄ贡**锛歚.\tools\quiet-probe.ps1`锛堣涓婃枃锛夛紝鎶婃姄鍒扮殑璁惧鍚嶅姞杩?`--phantom`銆?
+**测试**：`.\tests\run-full-selftest.ps1`（安全，不睡眠）；加 `-Force` 才是真睡眠测试。
+
+**先诊断到底是谁在捣乱**：`.\tools\quiet-probe.ps1`，把抓到的设备名加进 `--phantom`。
+排查手册见 [docs/troubleshooting.md](docs/troubleshooting.md)，测试细节见 [docs/testing.md](docs/testing.md)。
+
 ## CI
 
 `docs/ci-workflow.yml` is a ready-made GitHub Actions workflow: on a Windows runner it builds both
@@ -333,4 +272,4 @@ git push
 
 ## License
 
-MIT 鈥?see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

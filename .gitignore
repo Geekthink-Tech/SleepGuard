@@ -8,11 +8,16 @@ bin/
 *.log.old
 *.err.txt
 selftest.log
+selftest-sleep.log
 quiet-probe-log.txt
 sleep-monitor-log.txt
+launcher.log
+
+# test artefacts (written by tests\run-*.ps1)
+tests/artifacts/
+tools/artifacts/
 
 # editors / VS
 .vs/
 *.user
 *.suo
-launcher.log

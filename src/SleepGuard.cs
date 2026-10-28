@@ -173,31 +173,10 @@ internal static class SleepGuard
 
     private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
-    // Low-level hooks: a second, independent way to notice real input. Raw input
-    // (RIDEV_INPUTSINK) turned out to silently deliver nothing in this process
-    // context, while the same registration worked in a throwaway probe - so the
-    // watchdog trusts whichever channel actually fires.
-    private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
-    private static HookProc llMouseProc;
-    private static HookProc llKeyboardProc;
-    private static IntPtr hMouseHook = IntPtr.Zero;
-    private static IntPtr hKeyboardHook = IntPtr.Zero;
-    private static long llEvents;
-
-    private static IntPtr LLInput(int nCode, IntPtr wParam, IntPtr lParam)
-    {
-        try
-        {
-            if (nCode >= 0)
-            {
-                llEvents++;
-                if (llEvents == 1) TryLog("low-level hook: first real input event seen");
-                OnRealInput(IntPtr.Zero, "low-level hook");
-            }
-        }
-        catch { }
-        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
-    }
+    // v1.1.2: the low-level hook plumbing was removed. On the reference machine the
+    // hooks installed fine but never fired inside the guard, while raw input does work
+    // once the guard is built as a console-subsystem binary - see docs\troubleshooting.md.
+    // Dead code left behind only invited "why does nothing happen?" debugging sessions.
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern ushort RegisterClassExW(ref WNDCLASSEX lpwcx);
@@ -255,16 +234,6 @@ internal static class SleepGuard
         public uint cbSize;
         public uint dwTime;
     }
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SetWindowsHookExW(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
-
-    [DllImport("user32.dll")]
-    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern bool GetUserObjectInformationW(IntPtr hObj, int nIndex, StringBuilder pvInfo, uint nLength, out uint lpnLengthNeeded);
 
@@ -772,8 +741,8 @@ internal static class SleepGuard
         {
             lastHeartbeatMs = WallMs();
             Log(string.Format(CultureInfo.InvariantCulture,
-                "heartbeat: idle={0:F0}s displayOff={1} lastAudio={2:F0}s ago rawEvents={3} llEvents={4} osIdle={5}ms polls={6} keyHits={7} k58=0x{8:X4}", idle, displayOff,
-                (WallMs() - lastAudioMs) / 1000.0, rawEvents, llEvents, OsIdleMs(), pollTicks, keyHits, (short)GetAsyncKeyState(0x58)));
+                "heartbeat: idle={0:F0}s displayOff={1} lastAudio={2:F0}s ago rawEvents={3} osIdle={4}ms polls={5} keyHits={6} k58=0x{7:X4}", idle, displayOff,
+                (WallMs() - lastAudioMs) / 1000.0, rawEvents, OsIdleMs(), pollTicks, keyHits, (short)GetAsyncKeyState(0x58)));
         }
 
         // Direct hibernate while still awake (also covers the case where the sleep
@@ -917,8 +886,7 @@ internal static class SleepGuard
             {
                 rawEvents++;
                 inputMsgCount++;
-                bool verboseRaw = inputMsgCount <= 15;
-                if (verboseRaw) TryLog("wm_input #" + inputMsgCount + " lParam=0x" + lParam.ToInt64().ToString("X"));
+                if (rawEvents == 1) TryLog("raw input: first WM_INPUT received");
                 if (rawEvents == 1) TryLog("raw input: first WM_INPUT received");
                 // ROOT CAUSE OF THE CRASHES (fixed in v1.1.1): lParam of WM_INPUT is
                 // an HRAWINPUT handle, NOT a pointer to RAWINPUTHEADER. Marshalling it
@@ -928,7 +896,6 @@ internal static class SleepGuard
                 // out with GetRawInputData first, exactly like the RawProbe diagnostic.
                 uint rawSize = 0;
                 GetRawInputData(lParam, RID_INPUT, IntPtr.Zero, ref rawSize, (uint)Marshal.SizeOf(typeof(RAWINPUTHEADER)));
-                if (verboseRaw) TryLog("  stage1 size=" + rawSize);
                 if (rawSize == 0 || rawSize > 65536)
                 {
                     TryLog("  EARLY-RETURN bad size=" + rawSize);
@@ -939,7 +906,6 @@ internal static class SleepGuard
                 {
                     uint rawGot = rawSize;
                     uint copied = GetRawInputData(lParam, RID_INPUT, rawBuf, ref rawGot, (uint)Marshal.SizeOf(typeof(RAWINPUTHEADER)));
-                    if (verboseRaw) TryLog("  stage2 copied=" + copied + " got=" + rawGot + " expected=" + rawSize);
                     if (copied != rawGot)
                     {
                         TryLog("  EARLY-RETURN copied=" + copied + " got=" + rawGot);
