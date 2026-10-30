@@ -886,6 +886,7 @@ internal static class SleepGuard
         // Direct hibernate while still awake (also covers the case where the sleep
         // request was refused and the machine kept running).
         CheckPauseState(now);
+        CheckAgentAlive(now);
 
         // Never sleep/hibernate while the screens are visibly still on because the pause request
         // was not confirmed. On 2026-10-30 the agent had died, HiMOS kept the panel awake and the
@@ -1028,8 +1029,7 @@ internal static class SleepGuard
     // dark. So the guard confirms every pause against pause-state.txt and re-sends the request
     // while the display is still supposed to be dark.
     private static void CheckPauseState(long now)
-    {
-        if (!appsPaused) return;
+    {        if (!appsPaused) return;
         if (!pauseConfirmed)
         {
             string state = ReadPauseState();
@@ -1048,6 +1048,57 @@ internal static class SleepGuard
             if (WritePauseRequest("pause" + Environment.NewLine + list + Environment.NewLine + "attempt " + pauseAttempts + Environment.NewLine))
                 Log("pause-app: not confirmed after " + (PauseRetryMs / 1000) + "s -> re-requested pause (attempt " + pauseAttempts + ")");
         }
+    }
+
+    // Agent watchdog ----------------------------------------------------------
+    // The pause agent has died twice without a word (exit code 0xC000013A, STATUS_CONTROL_C_EXIT:
+    // something tears down its hidden console). Task Scheduler's repetition trigger cannot be
+    // trusted to bring it back - a dead process can leave the task instance in the Running state,
+    // and IgnoreNew then refuses to start a new one. So the guard checks the agent heartbeat and
+    // starts tests\start-sleepguard-agent.ps1 (idempotent, starts the agent through WMI).
+    private const int AgentStaleMs = 60000;   // heartbeat older than this means "agent is dead"
+    private static long lastAgentStartMs = -120000; // rate limit for the watchdog (negative so the first check runs immediately)
+
+    private static string AgentHeartbeatPath()
+    {
+        string dir = Path.GetDirectoryName(logPath);
+        if (string.IsNullOrEmpty(dir))
+            dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SleepGuard");
+        return Path.Combine(dir, "agent-heartbeat.txt");
+    }
+
+    private static long AgentHeartbeatAgeMs()
+    {
+        try
+        {
+            string p = AgentHeartbeatPath();
+            if (!File.Exists(p)) return long.MaxValue;
+            DateTime stamp = DateTime.Parse((File.ReadAllText(p) ?? "").Trim(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+            return (long)(DateTime.Now - stamp.ToLocalTime()).TotalMilliseconds;
+        }
+        catch (Exception ex) { TryLog("pause-app: heartbeat read failed: " + ex.Message); return long.MaxValue; }
+    }
+
+    private static void CheckAgentAlive(long now)
+    {
+        if (pauseApps.Length == 0) return;
+        if (now - lastAgentStartMs < 60000) return;
+        long age = AgentHeartbeatAgeMs();
+        if (age <= AgentStaleMs) return;
+        lastAgentStartMs = now;
+        string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        string launcher = Path.Combine(Path.Combine(baseDir, "tests"), "start-sleepguard-agent.ps1");
+        Log("pause-app: agent heartbeat is " + (age == long.MaxValue ? "missing" : (age / 1000) + "s old") + " -> starting " + launcher);
+        try
+        {
+            System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell\\v1.0\\powershell.exe");
+            psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + launcher + "\"";
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            System.Diagnostics.Process.Start(psi);
+        }
+        catch (Exception ex) { TryLog("pause-app: could not start the agent launcher: " + ex.Message); }
     }
 
     // Raw-input device handle -> "is this the phantom HID?" verdict, plus the
@@ -1095,9 +1146,11 @@ internal static class SleepGuard
         }
         if (pt.X != lastCursorX || pt.Y != lastCursorY)
         {
+            int dx = pt.X - lastCursorX;
+            int dy = pt.Y - lastCursorY;
             lastCursorX = pt.X;
             lastCursorY = pt.Y;
-            OnRealInput(IntPtr.Zero, "cursor " + pt.X + "," + pt.Y);
+            OnRealInput(IntPtr.Zero, "cursor " + pt.X + "," + pt.Y + " (dx=" + dx + " dy=" + dy + ")");
         }
     }
 
@@ -1448,7 +1501,7 @@ internal static class SleepGuard
         lastAudioMs = WallMs();
         displayOff = false;
         ResumeIdleApps("startup, previous guard died while paused");
-        Log("ready v1.2.0 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; ddc=" + ddcEnabled);
+        Log("ready v1.2.1 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled);
 
         if (testPause)
         {

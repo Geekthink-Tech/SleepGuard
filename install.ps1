@@ -98,8 +98,10 @@ Register-ScheduledTask -TaskName 'SleepGuard' -Action $action -Trigger $trigger 
 # The pause agent is a second logon task. It runs in the same interactive session but as a
 # normal PowerShell process, which on this machine can see and suspend processes that the guard
 # cannot (the guard saw 102 processes, Windows PowerShell 424, and HiMOS was simply absent).
+# The task runs the LAUNCHER, not the agent: the launcher exits immediately when the agent
+# heartbeat is fresh, so the 10-minute repetition doubles as a watchdog for a dead agent.
 if ($PauseApp) {
-    $agent     = Join-Path $root 'tests\sleepguard-agent.ps1'
+    $agent     = Join-Path $root 'tests\start-sleepguard-agent.ps1'
     $agentAct  = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
                     -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$agent`"" `
                     -WorkingDirectory $root

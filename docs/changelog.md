@@ -21,6 +21,10 @@
   - 同一 pid **不会重复挂起**（避免挂起计数加两次、恢复一次后仍冻结）；
   - 每 2 s 写 `agent-heartbeat.txt`，外部可判断代理是否活着。
 - 任务侧（`install.ps1`）：`SleepGuardAgent` 增加**每 10 分钟重复触发**（`IgnoreNew` 保持单实例）——代理被系统杀掉或自己崩掉后最多 10 分钟自动复活，不再需要人管。
+- **代理第二次死亡（21:36:46）**：这次连日志都没留，任务记录 `lastResult = 0xC000013A`（`STATUS_CONTROL_C_EXIT`，进程因“控制台被关/Ctrl+C”结束）；且死掉的实例让任务卡在 Running，`IgnoreNew` 的重复触发不会真正重启它。因此新增：
+  - `tests\start-sleepguard-agent.ps1`（幂等启动器）：读 `agent-heartbeat.txt`，新鲜（<45 s）就直接退出；过期/缺失就用 WMI 起代理并记 `agent-launcher.log`。任务的动作改成跑这个启动器，重复触发即变成“存活检查”。
+  - 守护内置看门狗：每秒检查心跳，超过 60 s 未更新就自己调用启动器（每分钟最多一次），日志 `pause-app: agent heartbeat is ... -> starting ...`。实测 21:47:30 用“心跳文件缺失”的场景触发成功。
+  - 光标日志带上位移 `cursor x,y (dx=.. dy=..)`，便于区分“真人移动”与面板电源切换时的指针跳变。
 - 实测：`--test-pause` 路径 21:32:03 代理挂起 5 个 HiMOS、21:32:05 恢复（日志齐全）；
   关屏路径 21:28:21 触发后守护按 15 s 间隔重发请求（`attempt` 递增到 6）并持续重关屏，直到真实鼠标输入唤醒。
 
