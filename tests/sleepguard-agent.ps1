@@ -2,6 +2,7 @@ param(
     [string]$RequestFile = (Join-Path $env:LOCALAPPDATA 'SleepGuard\pause-request.txt'),
     [string]$StateFile   = (Join-Path $env:LOCALAPPDATA 'SleepGuard\pause-state.txt'),
     [string]$LogFile     = (Join-Path $env:LOCALAPPDATA 'SleepGuard\agent.log'),
+    [string]$HeartbeatFile = (Join-Path $env:LOCALAPPDATA 'SleepGuard\agent-heartbeat.txt'),
     [int]$PollMs         = 500,
     [string]$GuardName   = 'SleepGuard'
 )
@@ -24,9 +25,13 @@ param(
 # So SleepGuard only writes a request file and this agent executes it:
 #   pause-request.txt:  "pause"           -> suspend every process named in the second line
 #                       "resume"          -> resume whatever this agent suspended
+# A third line ("attempt N") is ignored here: SleepGuard rewrites the same pause request when
+# the previous one was not confirmed, and the changed content is what makes it act again.
 # The agent writes pause-state.txt ("paused:<pids>", "idle", "no-app", "guard-gone") for the
-# test scripts, and it resumes the app if the guard disappears while it is still paused
-# (crash safety: otherwise the water-block display would stay frozen forever).
+# guard and for the test scripts, agent-heartbeat.txt with a timestamp every few seconds so a
+# watchdog can tell a live agent from a dead one, and it resumes the app if the guard
+# disappears while the app is still paused (crash safety: otherwise the water-block display
+# would stay frozen forever).
 
 $ErrorActionPreference = 'Stop'
 $agentId = $PID
@@ -67,6 +72,7 @@ function Suspend-NamedApp([string[]]$names) {
         $procs = @(Get-Process -Name $nm -ErrorAction SilentlyContinue)
         foreach ($p in $procs) {
             try {
+                if ($suspended.Contains($p.Id)) { continue }   # never suspend the same pid twice
                 $rc = [Sg.SgNative]::NtSuspendProcess($p.Handle)
                 if ($rc -eq 0) {
                     $suspended.Add($p.Id)
@@ -109,21 +115,38 @@ function Write-State([string]$state) {
     } catch { }
 }
 
+function Write-Heartbeat() {
+    try {
+        $parent = Split-Path -Parent $HeartbeatFile
+        if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+        Set-Content -LiteralPath $HeartbeatFile -Value ('{0:o}' -f (Get-Date)) -Encoding ascii
+    } catch { }
+}
+
 $dir = Split-Path -Parent $RequestFile
 if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 Write-AgentLog "agent started; request=$RequestFile state=$StateFile poll=${PollMs}ms"
 Write-State 'idle'
+Write-Heartbeat
 
+# The request is consumed by CONTENT, not by command word: a repeated "pause" that was never
+# confirmed must run again, so the guard varies the third line and the signature changes.
+$lastSignature = ''
 $lastCommand = ''
 $guardMissingSince = $null
+$lastHeartbeat = Get-Date
 
 while ($true) {
     try {
         $command = ''
         $names = @()
         $why = ''
+        $signature = ''
         if (Test-Path -LiteralPath $RequestFile) {
-            $lines = @(Get-Content -LiteralPath $RequestFile -Encoding utf8 -ErrorAction SilentlyContinue)
+            $raw = ''
+            try { $raw = [string](Get-Content -LiteralPath $RequestFile -Raw -Encoding utf8 -ErrorAction SilentlyContinue) } catch { }
+            $signature = ($raw -replace "`r`n", "`n").Trim()
+            $lines = @($signature -split "`n")
             if ($lines.Count -ge 1) { $command = ([string]$lines[0]).Trim().ToLowerInvariant() }
             if ($lines.Count -ge 2) {
                 $why = [string]$lines[1]
@@ -131,7 +154,7 @@ while ($true) {
             }
         }
 
-        if ($command -eq 'pause' -and $lastCommand -ne 'pause') {
+        if ($command -eq 'pause' -and $signature -ne $lastSignature) {
             if ($names.Count -eq 0) { $names = @('HiMOS') }
             $n = Suspend-NamedApp $names
             if ($n -gt 0) {
@@ -142,13 +165,15 @@ while ($true) {
                 Write-State 'no-app'
                 Write-AgentLog ("pause requested but no process of [{0}] was found" -f ($names -join ','))
             }
+            $lastSignature = $signature
             $lastCommand = 'pause'
             $guardMissingSince = $null
         }
-        elseif ($command -eq 'resume' -and $lastCommand -ne 'resume') {
+        elseif ($command -eq 'resume' -and $signature -ne $lastSignature) {
             $n = Resume-SuspendedApp
             Write-State 'idle'
             Write-AgentLog ("resumed {0} process(es) ({1})" -f $n, $why)
+            $lastSignature = $signature
             $lastCommand = 'resume'
             $guardMissingSince = $null
         }
@@ -164,6 +189,7 @@ while ($true) {
                     Write-State 'guard-gone'
                     Write-AgentLog ("guard is gone; resumed {0} process(es) for safety" -f $n)
                     $guardMissingSince = $null
+                    $lastSignature = ''
                     $lastCommand = 'resume'
                 }
             } else {
@@ -173,6 +199,10 @@ while ($true) {
         }
     } catch {
         Write-AgentLog ("loop error: " + $_.Exception.Message)
+    }
+    if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge 2) {
+        Write-Heartbeat
+        $lastHeartbeat = Get-Date
     }
     Start-Sleep -Milliseconds $PollMs
 }

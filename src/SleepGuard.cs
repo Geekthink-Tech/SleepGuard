@@ -82,6 +82,7 @@ internal static class SleepGuard
     private static long lastAudioMs;        // wall ms of the last tick that saw real audio
     private const int AudioGraceMs = 10000; // keep the display on this long after the last sound
     private const int DisplayRetryMs = 45000; // re-assert monitor-off at most this often while idle
+    private const int PauseRetryMs = 15000;   // re-send a pause request the agent never confirmed
     private static bool audioWasPlaying;    // for start/stop transition logging
     private static bool audioDebug;         // --audio-debug: heartbeat + every sample in the log
     private static long lastHeartbeatMs;
@@ -107,6 +108,9 @@ internal static class SleepGuard
     private static bool appsPaused;
     private static bool testPause;           // --test-pause: exercise pause/resume once at startup
     private static string pauseRequestPath = ""; // --pause-request: where the agent watches
+    private static long pauseRequestedMs;        // when the current pause request was written
+    private static int pauseAttempts;            // pause requests sent in this idle cycle
+    private static bool pauseConfirmed;          // the agent reported the app as suspended
     private static string lastPauseRequest = ""; // last request written (skip duplicates)
     private static bool ddcUnavailable;      // no monitor accepted a DDC write on this box
     private static bool panelDark;           // we asked the panels to go into DPMS standby
@@ -881,6 +885,14 @@ internal static class SleepGuard
 
         // Direct hibernate while still awake (also covers the case where the sleep
         // request was refused and the machine kept running).
+        CheckPauseState(now);
+
+        // Never sleep/hibernate while the screens are visibly still on because the pause request
+        // was not confirmed. On 2026-10-30 the agent had died, HiMOS kept the panel awake and the
+        // guard still slept the machine at 21:19:51 - from the desk that looks like "it went to
+        // sleep out of nowhere". After a few attempts we give up waiting and continue normally.
+        if (appsPaused && !pauseConfirmed && pauseAttempts < 4) return;
+
         if (hibernateSec > 0 && idle >= hibernateSec && now >= nextSleepRetryMs)
         {
             HibernateNow(string.Format(CultureInfo.InvariantCulture,
@@ -940,6 +952,26 @@ internal static class SleepGuard
         return Path.Combine(dir, "pause-request.txt");
     }
 
+    private static string PauseStatePath()
+    {
+        string dir = Path.GetDirectoryName(logPath);
+        if (string.IsNullOrEmpty(dir))
+            dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SleepGuard");
+        return Path.Combine(dir, "pause-state.txt");
+    }
+
+    // "paused:<pids>" or "no-app" means the agent read the request; "idle"/"guard-gone" do not.
+    private static string ReadPauseState()
+    {
+        try
+        {
+            string p = PauseStatePath();
+            if (!File.Exists(p)) return "";
+            return (File.ReadAllText(p) ?? "").Trim();
+        }
+        catch (Exception ex) { TryLog("pause-app: state read failed: " + ex.Message); return ""; }
+    }
+
     // Write only on a state change, otherwise the 20 ms input tick would rewrite the same
     // request dozens of times per second and spam both logs.
     private static bool WritePauseRequest(string text)
@@ -972,8 +1004,11 @@ internal static class SleepGuard
     {
         if (pauseApps.Length == 0 || appsPaused) return;
         appsPaused = true;
+        pauseConfirmed = false;
+        pauseAttempts = 1;
+        pauseRequestedMs = clock.ElapsedMilliseconds;
         string list = string.Join(",", pauseApps);
-        if (WritePauseRequest("pause" + Environment.NewLine + list + Environment.NewLine))
+        if (WritePauseRequest("pause" + Environment.NewLine + list + Environment.NewLine + "attempt " + pauseAttempts + Environment.NewLine))
             Log("pause-app: requested pause of [" + list + "] -> " + PauseRequestPath());
     }
 
@@ -981,8 +1016,38 @@ internal static class SleepGuard
     {
         if (!appsPaused) return;
         appsPaused = false;
+        pauseConfirmed = false;
+        pauseAttempts = 0;
         if (WritePauseRequest("resume" + Environment.NewLine + "(" + why + ")" + Environment.NewLine))
             Log("pause-app: requested resume (" + why + ") -> " + PauseRequestPath());
+    }
+
+    // The agent can die (it did on 2026-10-30: it survived a 44 h hibernation and then stopped
+    // answering). When that happens HiMOS keeps writing the phantom HID reports, the panel comes
+    // back on within seconds and the re-blank retries make the screen blink instead of staying
+    // dark. So the guard confirms every pause against pause-state.txt and re-sends the request
+    // while the display is still supposed to be dark.
+    private static void CheckPauseState(long now)
+    {
+        if (!appsPaused) return;
+        if (!pauseConfirmed)
+        {
+            string state = ReadPauseState();
+            if (state.StartsWith("paused:", StringComparison.OrdinalIgnoreCase) ||
+                state.Equals("no-app", StringComparison.OrdinalIgnoreCase))
+            {
+                pauseConfirmed = true;
+                Log("pause-app: confirmed by agent (state=" + state + ")");
+            }
+        }
+        if (!pauseConfirmed && pauseAttempts < 6 && now - pauseRequestedMs >= PauseRetryMs)
+        {
+            pauseAttempts++;
+            pauseRequestedMs = now;
+            string list = string.Join(",", pauseApps);
+            if (WritePauseRequest("pause" + Environment.NewLine + list + Environment.NewLine + "attempt " + pauseAttempts + Environment.NewLine))
+                Log("pause-app: not confirmed after " + (PauseRetryMs / 1000) + "s -> re-requested pause (attempt " + pauseAttempts + ")");
+        }
     }
 
     // Raw-input device handle -> "is this the phantom HID?" verdict, plus the

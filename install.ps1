@@ -108,7 +108,15 @@ if ($PauseApp) {
                     -ExecutionTimeLimit ([TimeSpan]::Zero) `
                     -MultipleInstances IgnoreNew -StartWhenAvailable `
                     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-    Register-ScheduledTask -TaskName 'SleepGuardAgent' -Action $agentAct -Trigger $trigger `
+    # The agent is a plain polling loop with no restart of its own: it died on 2026-10-30 after
+    # surviving a 44 h hibernation, and because nothing brought it back the screens stopped
+    # staying dark. A repetition trigger makes Task Scheduler restart it (IgnoreNew keeps one
+    # instance) so the death of the agent cannot silently disable the whole pause feature.
+    $agentTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $agentTrigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+                                    -RepetitionInterval (New-TimeSpan -Minutes 10) `
+                                    -RepetitionDuration ([TimeSpan]::MaxValue)).Repetition
+    Register-ScheduledTask -TaskName 'SleepGuardAgent' -Action $agentAct -Trigger $agentTrigger `
         -Principal $principal -Settings $agentSet -Force `
         -Description 'SleepGuard pause agent: suspends the phantom-input writer while the screens are dark and resumes it on real input.' | Out-Null
     Start-ScheduledTask -TaskName 'SleepGuardAgent'

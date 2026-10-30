@@ -188,7 +188,7 @@ Quick manual smoke test (does not install anything):
 
 ## Gotchas that cost the most time
 
-Full write-ups with evidence: [docs/troubleshooting.md](docs/troubleshooting.md). The six that
+Full write-ups with evidence: [docs/troubleshooting.md](docs/troubleshooting.md). The seven that
 matter if you are adapting this code:
 
 1. **`WM_INPUT` lParam is an `HRAWINPUT` handle, not a `RAWINPUTHEADER*`.** Dereferencing it kills
@@ -217,6 +217,14 @@ matter if you are adapting this code:
    `err=5` even with `SeDebugPrivilege`. Hence the out-of-process pause agent. Raw input is subject
    to the same filter: the same probe code received raw mouse input when built `/target:exe` and
    nothing when built `/target:winexe`.
+7. **A background helper that "just works" can be dead without saying so.** The pause agent
+   survived a 44 h hibernation and then stopped answering; because nobody checked, the panel kept
+   coming back on and the guard still put the machine to sleep at the 10 min mark — the desk saw
+   "it never blanked and then slept out of nowhere". v1.2.1: the agent rewrites
+   `agent-heartbeat.txt` every 2 s, the guard confirms every pause against `pause-state.txt`
+   (re-sending up to 6 times, `attempt N` in the request so content-based dedupe notices), refuses
+   to sleep while the pause is unconfirmed, and the `SleepGuardAgent` task repeats every 10 minutes
+   so a dead agent is restarted by Task Scheduler.
 
 ## Limitations
 
@@ -227,7 +235,10 @@ matter if you are adapting this code:
   name to `--phantom-audio` (`网易UU远程` is pre-configured).
 - `--pause-app` needs the `SleepGuardAgent` logon task (install.ps1 registers it). If the agent is
   not running nothing is paused: the monitors still blank, they just light up again because of the
-  phantom HID. The launcher restarts a missing agent.
+  phantom HID. The task repeats every 10 minutes (`IgnoreNew`), so a dead agent comes back on its
+  own; the launcher also restarts a missing agent at logon. The guard additionally refuses to
+  sleep/hibernate while its pause request is unconfirmed (max ~1 min), so a dead agent cannot make
+  the machine sleep with the panel still lit.
 - The hibernate resume timer may fire 30–40 s late on some firmware. Harmless in normal use.
 - Tested on Windows 11 (build 26300), x64, .NET Framework 4.8. Windows 10 should work; ARM64 is
   untested.
