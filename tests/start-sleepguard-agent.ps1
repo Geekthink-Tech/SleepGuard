@@ -58,13 +58,29 @@ try {
     Write-LauncherLog ("could not clear stale agents: {0}" -f $_.Exception.Message)
 }
 
-$cmd = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $AgentScript
+# Start the agent hidden with HideRun.exe: WMI creates that GUI-subsystem helper and the helper starts
+# the agent with CREATE_NO_WINDOW + SW_HIDE, so no console (and no Windows Terminal window) appears.
+# A direct powershell launch opened a Windows Terminal window on Windows 11 even with
+# -WindowStyle Hidden - that was the "PowerShell keeps popping up" report of 2026-11-05.
+# HideRun.exe lives under %LOCALAPPDATA%\SleepGuard: a copy inside the workspace folder starts but
+# exits before Main, so the agent never appears (verified 2026-11-05). Fall back to the old path.
+$hideRun = Join-Path $env:LOCALAPPDATA 'SleepGuard\HideRun.exe'
+if (-not (Test-Path -LiteralPath $hideRun)) { $hideRun = Join-Path (Split-Path -Parent $PSScriptRoot) 'HideRun.exe' }
+$cmdFile = Join-Path $env:TEMP 'sleepguard-agent-cmd.txt'
 try {
-    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd }
-    if ($r.ReturnValue -ne 0) {
-        Write-LauncherLog ("WMI Win32_Process.Create failed: {0}" -f $r.ReturnValue)
-    } else {
-        Write-LauncherLog ("agent started, pid={0}" -f $r.ProcessId)
+    if (Test-Path -LiteralPath $hideRun) {
+        $agentCmd = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $AgentScript + '"'
+        [System.IO.File]::WriteAllText($cmdFile, $agentCmd, [System.Text.UTF8Encoding]::new($false))
+        $wmi = '"' + $hideRun + '" "' + $cmdFile + '"'
+        $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $wmi }
+        if ($r.ReturnValue -ne 0) {
+            Write-LauncherLog ("WMI -> HideRun failed: {0}" -f $r.ReturnValue)
+        } else {
+            Write-LauncherLog ("agent start requested (hidden), HideRun pid={0}" -f $r.ProcessId)
+        }
+    }
+    else {
+        Write-LauncherLog ("HideRun.exe not found at {0}" -f $hideRun)
     }
 } catch {
     Write-LauncherLog ("could not start the agent: {0}" -f $_.Exception.Message)

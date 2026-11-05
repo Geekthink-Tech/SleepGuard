@@ -65,6 +65,21 @@ if (-not (Test-Path $exe)) {
     if (-not (Test-Path $exe)) { throw 'build did not produce dist\SleepGuard.exe' }
 }
 
+# HideRun.exe is the GUI-subsystem starter that keeps every console child (powershell) invisible.
+# It must live under %LOCALAPPDATA%\SleepGuard: a copy inside the project folder starts and then
+# exits before its own Main runs on the reference machine (files are blocked there), so the copy
+# under the workspace is unusable. $hideDir is also where the log and the pause handshake live.
+$hideDir = Join-Path $env:LOCALAPPDATA 'SleepGuard'
+New-Item -ItemType Directory -Force -Path $hideDir | Out-Null
+$hideExe = Join-Path $hideDir 'HideRun.exe'
+$hideDist = Join-Path $root 'dist\HideRun.exe'
+if (Test-Path $hideDist) {
+    Copy-Item $hideDist $hideExe -Force
+}
+elseif (-not (Test-Path $hideExe)) {
+    throw "HideRun.exe not found: expected $hideDist (run .\build.ps1) or $hideExe"
+}
+
 $argument = "--display $Display --sleep $Sleep --hibernate $Hibernate --phantom `"$Phantom`""
 if ($PauseApp) { $argument += " --pause-app `"$PauseApp`"" }
 
@@ -80,8 +95,12 @@ Unregister-ScheduledTask -TaskName 'SleepGuard' -Confirm:$false -ErrorAction Sil
 # shutdown privilege".
 $launcher = Join-Path $root 'launch-sleepguard.ps1'
 $user      = "$env:USERDOMAIN\$env:USERNAME"
-$action    = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
-                -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`" -Display $Display -Sleep $Sleep -Hibernate $Hibernate -Phantom `"$Phantom`" -PauseApp `"$PauseApp`"" `
+# The task action must NOT be powershell.exe: on Windows 11 Windows Terminal is the default console
+# host, so a console child shows a window even with -WindowStyle Hidden (that was the "PowerShell
+# keeps popping up" report of 2026-11-05). HideRun.exe is GUI-subsystem and starts the script with
+# CREATE_NO_WINDOW, so nothing is ever displayed.
+$action    = New-ScheduledTaskAction -Execute $hideExe `
+                -Argument "-w `"$launcher`" -Display $Display -Sleep $Sleep -Hibernate $Hibernate -Phantom `"$Phantom`" -PauseApp `"$PauseApp`"" `
                 -WorkingDirectory $root
 $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
@@ -90,6 +109,7 @@ $settings  = New-ScheduledTaskSettingsSet `
                 -ExecutionTimeLimit ([TimeSpan]::Zero) `
                 -MultipleInstances IgnoreNew -StartWhenAvailable `
                 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+$settings.Hidden = $true
 
 Register-ScheduledTask -TaskName 'SleepGuard' -Action $action -Trigger $trigger -Principal $principal `
     -Settings $settings -Force `
@@ -102,23 +122,22 @@ Register-ScheduledTask -TaskName 'SleepGuard' -Action $action -Trigger $trigger 
 # heartbeat is fresh, so the 10-minute repetition doubles as a watchdog for a dead agent.
 if ($PauseApp) {
     $agent     = Join-Path $root 'tests\start-sleepguard-agent.ps1'
-    $agentAct  = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
-                    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$agent`"" `
+    $agentAct  = New-ScheduledTaskAction -Execute $hideExe `
+                    -Argument "-w `"$agent`"" `
                     -WorkingDirectory $root
     $agentSet  = New-ScheduledTaskSettingsSet `
                     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                     -ExecutionTimeLimit ([TimeSpan]::Zero) `
                     -MultipleInstances IgnoreNew -StartWhenAvailable `
                     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-    # The agent is a plain polling loop with no restart of its own: it died on 2026-10-30 after
-    # surviving a 44 h hibernation, and because nothing brought it back the screens stopped
-    # staying dark. A repetition trigger makes Task Scheduler restart it (IgnoreNew keeps one
-    # instance) so the death of the agent cannot silently disable the whole pause feature.
-    $agentTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-    $agentTrigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
-                                    -RepetitionInterval (New-TimeSpan -Minutes 10) `
-                                    -RepetitionDuration ([TimeSpan]::MaxValue)).Repetition
-    Register-ScheduledTask -TaskName 'SleepGuardAgent' -Action $agentAct -Trigger $agentTrigger `
+    $agentSet.Hidden = $true
+    # -RepetitionDuration ([TimeSpan]::MaxValue) is rejected by Task Scheduler (0x80041318); leaving
+    # the duration out means "repeat forever", which is what the watchdog needs.
+    $agentTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+                        -RepetitionInterval (New-TimeSpan -Minutes 15)
+    $agentTrigger.Repetition.StopAtDurationEnd = $false
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    Register-ScheduledTask -TaskName 'SleepGuardAgent' -Action $agentAct -Trigger @($logonTrigger, $agentTrigger) `
         -Principal $principal -Settings $agentSet -Force `
         -Description 'SleepGuard pause agent: suspends the phantom-input writer while the screens are dark and resumes it on real input.' | Out-Null
     Start-ScheduledTask -TaskName 'SleepGuardAgent'

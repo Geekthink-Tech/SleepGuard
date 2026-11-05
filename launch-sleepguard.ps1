@@ -82,10 +82,33 @@ $cmdLine = '"' + $exe + '" --display ' + $Display + ' --sleep ' + $Sleep + ' --h
 if ($PauseApp) {
     $cmdLine += ' --pause-app "' + $PauseApp + '"'
 }
+# Start the guard with no console window at all.
+#
+# The guard must still be created by the WMI provider: a process started directly by Task Scheduler
+# has SeShutdownPrivilege present but unadjustable (SetSuspendState -> err=1314), while a WMI-created
+# process gets it enabled (ret=1). So WMI creates *HideRun.exe*, a GUI-subsystem helper that calls
+# CreateProcess with CREATE_NO_WINDOW + SW_HIDE. No console is ever created, which is what stops the
+# "PowerShell keeps popping up" windows on Windows 11 (Windows Terminal hosts every console child and
+# -WindowStyle Hidden does not prevent it).
+# HideRun.exe is installed under %LOCALAPPDATA%\SleepGuard on purpose. An identical binary placed
+# inside this workspace folder starts (it gets a pid) and then exits before its own Main runs, so
+# nothing happens - verified 2026-11-05 for every name and subfolder of sleep-guard\; the same bytes
+# run fine from %LOCALAPPDATA%, the Desktop and %TEMP%. Keep the copy here only as a fallback.
+$hideRun = Join-Path $env:LOCALAPPDATA 'SleepGuard\HideRun.exe'
+if (-not (Test-Path -LiteralPath $hideRun)) { $hideRun = Join-Path $here 'HideRun.exe' }
+$cmdFile = Join-Path $env:TEMP 'sleepguard-guard-cmd.txt'
 try {
-    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine }
-    Write-LaunchLog "WMI create return=$($r.ReturnValue) pid=$($r.ProcessId) args=[$cmdLine]"
-    if ($r.ReturnValue -ne 0) { exit 1 }
+    if (Test-Path -LiteralPath $hideRun) {
+        [System.IO.File]::WriteAllText($cmdFile, $cmdLine, [System.Text.UTF8Encoding]::new($false))
+        $wmi = '"' + $hideRun + '" "' + $cmdFile + '"'
+        $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $wmi }
+        Write-LaunchLog "WMI -> HideRun return=$($r.ReturnValue) pid=$($r.ProcessId) (hidden) args=[$cmdLine]"
+        if ($r.ReturnValue -ne 0) { exit 1 }
+    }
+    else {
+        Write-LaunchLog "HideRun.exe missing in $here - not starting the guard visibly"
+        exit 1
+    }
 }
 catch {
     Write-LaunchLog "WMI create failed: $($_.Exception.Message)"

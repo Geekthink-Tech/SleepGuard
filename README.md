@@ -226,6 +226,18 @@ matter if you are adapting this code:
    to sleep while the pause is unconfirmed, and the `SleepGuardAgent` task repeats every 10 minutes
    so a dead agent is restarted by Task Scheduler.
 
+8. **Every console child of a scheduled task shows up as a Windows Terminal window.** On Windows 11
+   Windows Terminal is the default console host, so a task action of `powershell.exe -File ...`
+   opens a window even with `-WindowStyle Hidden`; with a one-minute repetition it looks like
+   "PowerShell keeps popping up". The fix is a GUI-subsystem helper (`tools/HideRun.cs`) that calls
+   `CreateProcessW` with `CREATE_NO_WINDOW` + `SW_HIDE` and gives the child the `NUL` device as
+   stdin/stdout/stderr — without those handles `powershell.exe` exits with code 1 before running a
+   single line. Two more traps found the hard way: the helper must **wait** for the child
+   (`HideRun.exe -w ...`), otherwise Task Scheduler's kill-on-job-close job destroys the script the
+   moment the helper exits; and the helper itself must be installed under
+   `%LOCALAPPDATA%\SleepGuard\`, because the very same bytes placed inside the project folder start
+   and then exit before `Main` (verified for every name and subfolder).
+
 ## Limitations
 
 - Runs in the interactive desktop session only (that is where raw input and `SC_MONITORPOWER` live).

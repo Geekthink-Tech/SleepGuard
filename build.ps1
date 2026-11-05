@@ -52,4 +52,18 @@ if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 
 $file = Get-Item $target
 Write-Host ("  {0,-16} {1,8:N0} bytes  ({2})" -f $file.Name, $file.Length, $file.LastWriteTime) -ForegroundColor Green
+
+# HideRun.exe: GUI-subsystem helper that starts a command line with CREATE_NO_WINDOW + SW_HIDE.
+# Everything the tasks / launcher / watchdog start goes through it, otherwise Windows Terminal hosts
+# the console child and the user sees "PowerShell keeps popping up" windows.
+$hideSrc = Join-Path $root 'tools\HideRun.cs'
+if (Test-Path $hideSrc) {
+    $hideTarget = Join-Path $out 'HideRun.exe'
+    Write-Host 'csc tools\HideRun.cs -> dist\HideRun.exe (/target:winexe)' -ForegroundColor Cyan
+    & $csc /nologo /optimize+ /target:winexe "/out:$hideTarget" $hideSrc
+    if ($LASTEXITCODE -ne 0) { throw "HideRun build failed (exit $LASTEXITCODE)" }
+    $hf = Get-Item $hideTarget
+    Write-Host ("  {0,-16} {1,8:N0} bytes  ({2})" -f $hf.Name, $hf.Length, $hf.LastWriteTime) -ForegroundColor Green
+}
+
 Write-Host 'Build OK. Next: .\install.ps1 (elevated PowerShell) or run dist\SleepGuard.exe manually.' -ForegroundColor Green

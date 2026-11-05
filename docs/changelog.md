@@ -2,6 +2,34 @@
 
 时间均为 2026 年 10–11 月，机器为本仓库的开发机（Windows 11 build 26300，双显示器，水冷屏 HID，网易UU远程）。
 
+## v1.2.4 — 2026-11-05
+
+修"PowerShell 控制台一直弹窗"（用户报告，附图：`管理员: C:\Windows\System32` 的 PowerShell 窗口）。
+
+- 根因一：`SleepGuard` 与 `SleepGuardAgent` 两个计划任务的 Action 都是 `powershell.exe -File ...`，
+  且都带重复触发（`SleepGuard` 甚至每分钟一次）；Windows 11 默认终端是 Windows Terminal，任何
+  console 子进程都会开窗，`-WindowStyle Hidden` 挡不住。实测唯一带 PowerShell 标题的窗口就是
+  WindowsTerminal，其启动时刻与代理重启时刻严格一致。
+- 根因二：v1.2.4 之前试过的 `wscript.exe` + `WshShell.Run(..., 0)` 在 WMI 上下文里会卡死（wscript
+  进程常驻、子进程从不出现）；换成自写 `HideRun.exe` 后又发现 Task Scheduler 把任务进程放在
+  "kill on job close" 的 job 对象里，helper 一退出子脚本立刻被杀（launcher/agent 一行日志都没写）。
+- 修复：
+  1. 新增 `tools/HideRun.cs` → `HideRun.exe`（`/target:winexe`）：`CreateProcessW` +
+     `CREATE_NO_WINDOW` + `STARTF_USESHOWWINDOW/SW_HIDE`，并把 `NUL` 设备接到子进程的
+     stdin/stdout/stderr（GUI 父进程没有标准句柄；`powershell.exe` 拿到 NULL 句柄会直接 exit 1，
+     什么都不执行）。
+  2. `HideRun.exe -w`：等子进程结束再退出，任务进程因此一直存活，job 不会杀子脚本。
+  3. 两个任务 Action 改为 `%LOCALAPPDATA%\SleepGuard\HideRun.exe -w "<script>"`，
+     `Settings.Hidden = true`；`SleepGuard` 去掉每分钟重复触发（只保留登录触发），
+     `SleepGuardAgent` 重复间隔改为 15 分钟。
+  4. `launch-sleepguard.ps1`、`tests/start-sleepguard-agent.ps1` 以及守护的看门狗都改为经
+     `%LOCALAPPDATA%\SleepGuard\HideRun.exe` 启动。
+  5. 坑：`HideRun.exe` 放在项目目录里**不能执行**——进程起来后在 Main 之前就退出（换名字、换子目录
+     都一样），同样字节放 `%LOCALAPPDATA%`、桌面、`%TEMP%` 均正常，所以安装脚本必须把它复制到
+     `%LOCALAPPDATA%\SleepGuard\`。
+- 结果：22:33 用任务路径重新拉起守护（pid 28704）与代理，日志 `ready v1.2.4`、心跳正常，
+  **全程没有新的 WindowsTerminal / 控制台窗口**（`WindowsTerminal` 进程数前后都是 0）。
+
 ## v1.2.3 — 2026-11-05
 
 修"屏幕没熄，机器却睡了"，并让门禁不再挡住关屏重试。

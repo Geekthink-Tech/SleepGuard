@@ -1114,16 +1114,22 @@ internal static class SleepGuard
         Log("pause-app: agent heartbeat is " + (age == long.MaxValue ? "missing" : (age / 1000) + "s old") + " -> starting " + launcher);
         try
         {
-            // UseShellExecute=true on purpose: the guard was started through WMI and has no
-            // console of its own; a child console app inheriting its std handles exits before it
-            // runs the script (that is why every spawn before 2026-11-05 was a silent no-op).
+            // Start HideRun.exe (a GUI-subsystem helper) so the launcher never gets a console
+            // window: starting powershell.exe here - even with -WindowStyle Hidden - opened a
+            // Windows Terminal window on Windows 11 (the "PowerShell keeps popping up" report of
+            // 2026-11-05). HideRun keeps using the WMI-created token of this process.
+            // HideRun.exe is installed under %LOCALAPPDATA%\SleepGuard: a copy inside a workspace
+            // folder starts and then exits before Main (verified 2026-11-05), so only the deployed
+            // location is trusted; the base directory copy is the fallback.
+            string hideRun = Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SleepGuard"), "HideRun.exe");
+            if (!File.Exists(hideRun)) hideRun = Path.Combine(baseDir, "HideRun.exe");
             System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo();
-            psi.FileName = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell\\v1.0\\powershell.exe");
-            psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + launcher + "\"";
-            psi.UseShellExecute = true;
-            psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+            psi.FileName = hideRun;
+            psi.Arguments = "\"" + launcher + "\"";
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
             System.Diagnostics.Process child = System.Diagnostics.Process.Start(psi);
-            Log("pause-app: agent launcher started, pid=" + (child == null ? "?" : child.Id.ToString(CultureInfo.InvariantCulture)));
+            Log("pause-app: agent launcher started hidden, pid=" + (child == null ? "?" : child.Id.ToString(CultureInfo.InvariantCulture)));
         }
         catch (Exception ex) { TryLog("pause-app: could not start the agent launcher: " + ex.Message); }
 
@@ -1541,7 +1547,7 @@ internal static class SleepGuard
         lastAudioMs = WallMs();
         displayOff = false;
         ResumeIdleApps("startup, previous guard died while paused");
-        Log("ready v1.2.3 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled);
+        Log("ready v1.2.4 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled);
 
         if (testPause)
         {
