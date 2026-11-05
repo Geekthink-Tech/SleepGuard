@@ -71,7 +71,9 @@ try {
     if (Test-Path -LiteralPath $hideRun) {
         $agentCmd = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $AgentScript + '"'
         [System.IO.File]::WriteAllText($cmdFile, $agentCmd, [System.Text.UTF8Encoding]::new($false))
-        $wmi = '"' + $hideRun + '" "' + $cmdFile + '"'
+        # -w: HideRun waits for the child. A helper that exits immediately is destroyed together with
+        # the child by the kill-on-job-close job WMI presents, so the guard/agent died seconds later.
+        $wmi = '"' + $hideRun + '" -w "' + $cmdFile + '"'
         $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $wmi }
         if ($r.ReturnValue -ne 0) {
             Write-LauncherLog ("WMI -> HideRun failed: {0}" -f $r.ReturnValue)

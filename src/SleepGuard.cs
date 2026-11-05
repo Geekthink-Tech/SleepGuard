@@ -1125,7 +1125,7 @@ internal static class SleepGuard
             if (!File.Exists(hideRun)) hideRun = Path.Combine(baseDir, "HideRun.exe");
             System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo();
             psi.FileName = hideRun;
-            psi.Arguments = "\"" + launcher + "\"";
+            psi.Arguments = "-w \"" + launcher + "\"";
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             System.Diagnostics.Process child = System.Diagnostics.Process.Start(psi);

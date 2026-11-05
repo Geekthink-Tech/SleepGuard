@@ -100,7 +100,9 @@ $cmdFile = Join-Path $env:TEMP 'sleepguard-guard-cmd.txt'
 try {
     if (Test-Path -LiteralPath $hideRun) {
         [System.IO.File]::WriteAllText($cmdFile, $cmdLine, [System.Text.UTF8Encoding]::new($false))
-        $wmi = '"' + $hideRun + '" "' + $cmdFile + '"'
+        # -w: HideRun waits for the child. A helper that exits immediately is destroyed together with
+        # the child by the kill-on-job-close job WMI presents, so the guard/agent died seconds later.
+        $wmi = '"' + $hideRun + '" -w "' + $cmdFile + '"'
         $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $wmi }
         Write-LaunchLog "WMI -> HideRun return=$($r.ReturnValue) pid=$($r.ProcessId) (hidden) args=[$cmdLine]"
         if ($r.ReturnValue -ne 0) { exit 1 }

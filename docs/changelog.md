@@ -27,6 +27,10 @@
   5. 坑：`HideRun.exe` 放在项目目录里**不能执行**——进程起来后在 Main 之前就退出（换名字、换子目录
      都一样），同样字节放 `%LOCALAPPDATA%`、桌面、`%TEMP%` 均正常，所以安装脚本必须把它复制到
      `%LOCALAPPDATA%\SleepGuard\`。
+- 6. 所有 HideRun 调用都必须带 `-w`：`start-sleepguard-agent.ps1` 与守护的看门狗最初没传 `-w`，
+    代理起来约 1 分钟后随 helper 一起被 WMI 的 kill-on-job-close job 杀掉（心跳停在 22:33:58）；
+    补上 `-w` 后代理稳定存活（22:35:25 起，心跳持续刷新），手动 pause/resume 验证 HiMOS 5 个进程
+    被挂起后正确恢复。
 - 结果：22:33 用任务路径重新拉起守护（pid 28704）与代理，日志 `ready v1.2.4`、心跳正常，
   **全程没有新的 WindowsTerminal / 控制台窗口**（`WindowsTerminal` 进程数前后都是 0）。
 
