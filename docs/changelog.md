@@ -1,6 +1,28 @@
 # 版本记录
 
-时间均为 2026 年 10 月，机器为本仓库的开发机（Windows 11 build 26300，双显示器，水冷屏 HID，网易UU远程）。
+时间均为 2026 年 10–11 月，机器为本仓库的开发机（Windows 11 build 26300，双显示器，水冷屏 HID，网易UU远程）。
+
+## v1.2.3 — 2026-11-05
+
+修"屏幕没熄，机器却睡了"，并让门禁不再挡住关屏重试。
+
+- 现场（2026-11-05 11:17）：代理已死 3 天（`SleepGuardAgent` 任务 `lastResult=0x0`、`LastRunTime` 停在 10-30，
+  重复触发从未真正启动过；`agent.log` 停在 11-02 22:19）。11:12:21 守护关屏并写 pause 请求，没人执行 →
+  HiMOS 继续每 ~0.3 s 发 consumer-control 报文 → 面板又亮；守护每 15 s 重发（`attempt` 递增到 6），
+  旧门禁 `pauseAttempts < 4` 在 4 次后放行 → **11:17:21 请求 S3，此时屏幕仍是亮的**；
+  11:17:46 用户按电源键唤醒（只睡了 25 s，不是休眠）。
+- 当天真正的休眠是 00:09:52 与 08:00:09 两次（各自在 S3 后 20 分钟转 S4），07:30 / 09:45 恢复 ——
+  "没有睡眠阶段、直接休眠"的观感来自"熄屏阶段根本没出现"。
+- 门禁改为布尔 `sleepBlocked`：**只挡休眠/睡眠，不再提前 return**。旧写法 return 掉的是整个 OnTick 剩余部分，
+  连后面的关屏分支一起跳过 —— 于是不再重关屏、也不再重发 pause，屏幕就一直亮着。
+  新增兜底 `PauseGateGiveUpMs = 900000`：代理始终不确认时，15 分钟后记
+  `pause-app never confirmed after 15 min - giving up the sleep gate` 再让策略正常运行
+  （一台永不睡眠的机器比一张没关的屏幕更糟）。
+- 生产日志瘦身：删掉每次真实输入一行（`real raw input #N`）、每设备一行（`raw device seen: ...`）、
+  重复的 `first WM_INPUT` 行；心跳里的 `rawEvents` 仍能看累计值。
+- 实测：11:28:55 守门狗在心跳过期 98 s 时自动拉起代理（`agent launcher started, pid=35172` →
+  `agent started, pid=13584`）；v1.2.3 编译部署后生产守护运行正常，日志只剩
+  `ready v1.2.3 ... pause-app=HiMOS confirmed+watchdog`。
 
 ## v1.2.1 — 2026-10-30
 

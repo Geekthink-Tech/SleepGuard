@@ -44,6 +44,20 @@ if ($age -ge 0 -and $age -lt $StaleSeconds) {
 $ageText = if ($age -lt 0) { 'missing' } else { ('{0:F0}s old' -f $age) }
 Write-LauncherLog ("agent heartbeat is {0} -> starting the agent via WMI" -f $ageText)
 
+# A zombie agent (process alive, loop dead) still holds the single-instance mutex, so a new
+# instance would exit immediately. Clear it first; safe because the heartbeat says the old loop
+# stopped working.
+try {
+    $stale = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.CommandLine -like '*sleepguard-agent.ps1*' -and $_.CommandLine -notlike '*start-sleepguard-agent.ps1*' }
+    foreach ($p in $stale) {
+        Write-LauncherLog ("stopping stale agent pid={0}" -f $p.ProcessId)
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+} catch {
+    Write-LauncherLog ("could not clear stale agents: {0}" -f $_.Exception.Message)
+}
+
 $cmd = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $AgentScript
 try {
     $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd }

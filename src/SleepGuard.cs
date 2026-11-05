@@ -110,6 +110,8 @@ internal static class SleepGuard
     private static string pauseRequestPath = ""; // --pause-request: where the agent watches
     private static long pauseRequestedMs;        // when the current pause request was written
     private static int pauseAttempts;            // pause requests sent in this idle cycle
+    private static long lastPauseGateLogMs;      // rate-limits the "screens are still on" log
+    private const long PauseGateGiveUpMs = 900000; // 15 min: a stuck agent must not keep this PC awake forever
     private static bool pauseConfirmed;          // the agent reported the app as suspended
     private static string lastPauseRequest = ""; // last request written (skip duplicates)
     private static bool ddcUnavailable;      // no monitor accepted a DDC write on this box
@@ -892,16 +894,36 @@ internal static class SleepGuard
         // was not confirmed. On 2026-10-30 the agent had died, HiMOS kept the panel awake and the
         // guard still slept the machine at 21:19:51 - from the desk that looks like "it went to
         // sleep out of nowhere". After a few attempts we give up waiting and continue normally.
-        if (appsPaused && !pauseConfirmed && pauseAttempts < 4) return;
+        // A flag, not an early return: returning here also skipped the display branch, so once
+        // the pause had been requested and stayed unconfirmed the guard stopped retrying the
+        // blank and stopped re-requesting the pause. It also gave up after four attempts, which
+        // is how a lit screen still ended in S3+S4 on 2026-11-05.
+        bool sleepBlocked = appsPaused && !pauseConfirmed && now - pauseRequestedMs < PauseGateGiveUpMs;
+        if (appsPaused && !pauseConfirmed && !sleepBlocked)
+        {
+            // A lit screen is bad, a machine that never sleeps is worse: after 15 minutes the
+            // gate gives up and the normal policy runs again (logged once a minute).
+            if (WallMs() - lastPauseGateLogMs > 60000)
+            {
+                lastPauseGateLogMs = WallMs();
+                Log("pause-app never confirmed after 15 min - giving up the sleep gate (a stuck agent must not keep this machine awake)");
+            }
+        }
+        if (sleepBlocked && WallMs() - lastPauseGateLogMs > 60000)
+        {
+            lastPauseGateLogMs = WallMs();
+            Log(string.Format(CultureInfo.InvariantCulture,
+                "sleep/hibernate postponed: pause-app not confirmed (attempt {0}) - the screens are still on", pauseAttempts));
+        }
 
-        if (hibernateSec > 0 && idle >= hibernateSec && now >= nextSleepRetryMs)
+        if (!sleepBlocked && hibernateSec > 0 && idle >= hibernateSec && now >= nextSleepRetryMs)
         {
             HibernateNow(string.Format(CultureInfo.InvariantCulture,
                 "IDLE {0:F0}s >= hibernate threshold {1}s", idle, hibernateSec));
             return;
         }
 
-        if (sleepSec > 0 && idle >= sleepSec && now >= nextSleepRetryMs)
+        if (!sleepBlocked && sleepSec > 0 && idle >= sleepSec && now >= nextSleepRetryMs)
         {
             // If the machine refuses to sleep (another power request is holding it
             // awake), fall through and at least turn the display off.
@@ -1058,6 +1080,7 @@ internal static class SleepGuard
     // starts tests\start-sleepguard-agent.ps1 (idempotent, starts the agent through WMI).
     private const int AgentStaleMs = 60000;   // heartbeat older than this means "agent is dead"
     private static long lastAgentStartMs = -120000; // rate limit for the watchdog (negative so the first check runs immediately)
+    private static long lastAgentTaskRunMs;       // last schtasks /run fallback
 
     private static string AgentHeartbeatPath()
     {
@@ -1091,16 +1114,36 @@ internal static class SleepGuard
         Log("pause-app: agent heartbeat is " + (age == long.MaxValue ? "missing" : (age / 1000) + "s old") + " -> starting " + launcher);
         try
         {
+            // UseShellExecute=true on purpose: the guard was started through WMI and has no
+            // console of its own; a child console app inheriting its std handles exits before it
+            // runs the script (that is why every spawn before 2026-11-05 was a silent no-op).
             System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo();
             psi.FileName = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell\\v1.0\\powershell.exe");
             psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + launcher + "\"";
-            psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-            System.Diagnostics.Process.Start(psi);
+            psi.UseShellExecute = true;
+            psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+            System.Diagnostics.Process child = System.Diagnostics.Process.Start(psi);
+            Log("pause-app: agent launcher started, pid=" + (child == null ? "?" : child.Id.ToString(CultureInfo.InvariantCulture)));
         }
         catch (Exception ex) { TryLog("pause-app: could not start the agent launcher: " + ex.Message); }
-    }
 
+        // Last resort when the shell spawn keeps failing: let Task Scheduler run the launcher.
+        if (age > AgentStaleMs * 3 && now - lastAgentTaskRunMs > 120000)
+        {
+            lastAgentTaskRunMs = now;
+            try
+            {
+                System.Diagnostics.ProcessStartInfo tsi = new System.Diagnostics.ProcessStartInfo();
+                tsi.FileName = Path.Combine(Environment.SystemDirectory, "schtasks.exe");
+                tsi.Arguments = "/run /tn SleepGuardAgent";
+                tsi.UseShellExecute = false;
+                tsi.CreateNoWindow = true;
+                System.Diagnostics.Process.Start(tsi);
+                Log("pause-app: asked Task Scheduler to run SleepGuardAgent");
+            }
+            catch (Exception ex) { TryLog("pause-app: schtasks /run failed: " + ex.Message); }
+        }
+    }
     // Raw-input device handle -> "is this the phantom HID?" verdict, plus the
     // resolved name for logging. Filled lazily on first event per handle.
     private static readonly System.Collections.Generic.Dictionary<IntPtr, bool> deviceIsPhantom =
@@ -1200,7 +1243,6 @@ internal static class SleepGuard
                 rawEvents++;
                 inputMsgCount++;
                 if (rawEvents == 1) TryLog("raw input: first WM_INPUT received");
-                if (rawEvents == 1) TryLog("raw input: first WM_INPUT received");
                 // ROOT CAUSE OF THE CRASHES (fixed in v1.1.1): lParam of WM_INPUT is
                 // an HRAWINPUT handle, NOT a pointer to RAWINPUTHEADER. Marshalling it
                 // directly dereferenced invalid memory and killed the process with
@@ -1236,7 +1278,7 @@ internal static class SleepGuard
                         phantom = IsPhantom(name);
                         deviceIsPhantom[hdr.hDevice] = phantom;
                         deviceNames[hdr.hDevice] = name;
-                        TryLog("raw device seen: type=" + hdr.dwType + " phantom=" + phantom + " name=" + name);
+                        // classification is cached per device handle; no log line per device (v1.2.3)
                     }
                     else
                     {
@@ -1245,8 +1287,6 @@ internal static class SleepGuard
                     if (!phantom)
                     {
                         realInputEvents++;
-                        if (realInputEvents <= 8)
-                            TryLog("real raw input #" + realInputEvents + " type=" + hdr.dwType + " name=" + name);
                         string kind = hdr.dwType == 0 ? "mouse" : (hdr.dwType == 1 ? "keyboard" : "hid");
                         OnRealInput(hdr.hDevice, kind + " " + name);
                     }
@@ -1501,7 +1541,7 @@ internal static class SleepGuard
         lastAudioMs = WallMs();
         displayOff = false;
         ResumeIdleApps("startup, previous guard died while paused");
-        Log("ready v1.2.1 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled);
+        Log("ready v1.2.3 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled);
 
         if (testPause)
         {
