@@ -1556,7 +1556,7 @@ internal static class SleepGuard
         lastAudioMs = WallMs();
         displayOff = false;
         ResumeIdleApps("startup, previous guard died while paused");
-        Log("ready v1.2.4 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled);
+        Log("ready v1.2.5 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled);
 
         if (testPause)
         {
