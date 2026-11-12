@@ -2,6 +2,16 @@
 
 时间均为 2026 年 10–11 月，机器为本仓库的开发机（Windows 11 build 26300，双显示器，水冷屏 HID，网易UU远程）。
 
+## v1.2.5 — 2026-11-12
+
+- 修“从睡眠唤醒后守护又立刻请求睡眠”：guard 的空闲计时用墙钟，S3 期间时间继续走，所以用户按电源键
+  唤醒的下一秒 OnTick 就计算出 `IDLE 49701s` 并再次请求 S3（2026-11-12 21:17:56 现场日志）。现在
+  `WM_POWERBROADCAST` 的 resume 通知会记下 `lastResumeWallMs`，OnTick 在唤醒后 30 秒内把 idle 视为 0，
+  消除“叫醒后又被睡回去”的竞态。
+- 背景：Windows 的“在此时间后休眠”在 2026-11-09 已置 0（`HIBERNATEIDLE` AC/DC = 0x0），11-09 之后
+  没有任何 `Hibernate from Sleep - Fixed Timeout` 事件；用户看到的“自动休眠”其实是 10 分钟空闲后的
+  S3 睡眠，而键盘唤醒受 BIOS 的 USB 唤醒/ErP 设置限制。
+
 ## v1.2.4 — 2026-11-05
 
 修"PowerShell 控制台一直弹窗"（用户报告，附图：`管理员: C:\Windows\System32` 的 PowerShell 窗口）。

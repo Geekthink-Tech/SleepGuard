@@ -77,6 +77,7 @@ internal static class SleepGuard
     private static readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
 
     private static long lastRealMs;
+    private static long lastResumeWallMs = -60000;  // wall ms of the last "resumed" power notification
     private static bool displayOff;
     private static bool displayPostponed;   // audio/video is playing -> display-off deferred
     private static long lastAudioMs;        // wall ms of the last tick that saw real audio
@@ -872,6 +873,13 @@ internal static class SleepGuard
         long now = clock.ElapsedMilliseconds;
         double idle = (now - lastRealMs) / 1000.0;
 
+        // Wall-clock idle keeps running while the machine is in S3, so on every resume the first
+        // policy tick can see "idle 13 h" and ask for S3 again 1 s after the user pressed the power
+        // button (2026-11-12 21:17:56: IDLE 49701s -> requesting suspend right after the resume).
+        // Treat the first 30 s after a resume as "the user is here"; the resume notification itself
+        // resets lastRealMs, this is the belt-and-braces guard for the ordering race.
+        if (WallMs() - lastResumeWallMs < 30000) idle = 0;
+
         // Sample audio every second: a 1-second notification "ding" must not
         // postpone the display for the whole idle period, so the display branch
         // only looks at how recently real audio was playing.
@@ -1316,6 +1324,7 @@ internal static class SleepGuard
                 if ((int)wParam == PBT_APMRESUMEAUTOMATIC || (int)wParam == PBT_APMRESUME)
                 {
                     lastRealMs = clock.ElapsedMilliseconds;
+                    lastResumeWallMs = WallMs();
                     displayOff = false;
                     Log("power notification: system resumed -> idle clock reset");
                 }
