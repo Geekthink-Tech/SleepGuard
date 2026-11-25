@@ -39,20 +39,21 @@ SleepGuard solves it by keeping its own idle clock:
 | Mouse / keyboard / pen / touch / precision touchpad raw input from a normal device | yes, resets the clock |
 | Raw input from a device whose name matches a phantom pattern (default `VID_1D6B&PID_0122`) | no — ignored |
 | Anything else (vendor HID, sensor, consumer control) | no — it never reaches `WM_INPUT` as mouse/keyboard |
-| Audio / video currently playing | monitor-off is postponed (sleep/hibernate still happen) |
+| Audio / video currently playing (v1.2.6) | monitor-off **and** sleep/hibernate are postponed - only the screen is managed |
 
 ## Behaviour
 
 | Real idle | Action | Notes |
 |---|---|---|
 | ≥ `--display` (default 300 s) | Turn the monitor off (`SC_MONITORPOWER`) | Postponed while audio/video is playing; re-sent every 45 s while still idle; `--pause-app` is paused while dark |
-| ≥ `--sleep` (default 600 s) | Suspend to RAM (S3) | Any real input wakes it instantly |
-| ≥ `--hibernate` (default 1800 s) | Hibernate (S4) | Implemented as *sleep first, then hibernate*: a resume timer wakes the machine at `--hibernate` and it hibernates |
+| ≥ `--sleep` (default 600 s) | Suspend to RAM (S3) | Postponed while audio/video is playing (v1.2.6); any real input wakes it instantly |
+| ≥ `--hibernate` (default 1800 s) | Hibernate (S4) | Implemented as *sleep first, then hibernate*: a resume timer wakes the machine at `--hibernate` and it hibernates; also postponed while media plays |
 | any time | Real keyboard/mouse | Clock resets, display wakes |
 
-Audio playing does **not** stop sleep/hibernate by design (music alone should not keep the PC
-awake). Only the monitor-off step is postponed — the "watching a video / listening to a podcast,
-the screen would otherwise go black" exception.
+Media playback keeps the machine awake (v1.2.6, user request 2026-11-25): while
+something renders audio on the default endpoint, sleep and hibernate are postponed and only the screen rules
+(`--display`) still apply. Pass `--no-audio-awake` to get the old behaviour back (media only postpones the
+display-off, the PC still sleeps on schedule).
 
 ## Quick start
 
@@ -88,6 +89,8 @@ Get-Content "$env:LOCALAPPDATA\SleepGuard\sleep-guard.log" -Tail 30
 | `--pause-app <a,b>` | `HiMOS` (set in install.ps1) | Comma-separated process names that write phantom input; paused while the screens are dark and resumed on the first real input. Handled by the `SleepGuardAgent` task, because the guard cannot see those processes itself on this machine |
 | `--pause-request <path>` | log directory | Where the guard writes `pause` / `resume` requests for the agent (`%LOCALAPPDATA%\SleepGuard\pause-request.txt` in production) |
 | `--audio-debug` | off | Log every audio session state and a 30 s heartbeat (noisy; diagnosis only) |
+| `--no-audio-awake` | off (i.e. audio keeps the PC awake) | v1.2.6: opt out - media playback no longer postpones sleep/hibernate, only the display-off |
+| `--test-audio` | off | **Test only**: behave as if media is playing forever, so the audio gate can be verified without a real player |
 | `--log <path>` | `%LOCALAPPDATA%\SleepGuard\sleep-guard.log` | Log file (rotated to `.old` at 1 MB) |
 | `--wake <sec>` | `0` | **Test only**: arm a resume timer before suspending so the machine wakes itself |
 | `--hib-wake <sec>` | `0` | **Test only**: same for the hibernate step |
@@ -174,9 +177,11 @@ Quick manual smoke test (does not install anything):
 5. Hibernate chain: before suspending it arms a waitable timer for `--hibernate - --sleep` seconds
    with `fResume = TRUE`. The machine wakes, sees the elapsed wall time has reached the total idle
    target and calls `SetSuspendState(TRUE, ...)`. Real input in the meantime cancels the hibernate.
-6. Audio exception: CoreAudio `IAudioSessionManager2` session enumeration on the default render
-   endpoint; any `AudioSessionStateActive` session postpones monitor-off. Sessions whose display
-   name matches `--phantom-audio` are skipped. Sleep/hibernate timing is untouched.
+6. Audio rule (v1.2.6): CoreAudio `IAudioSessionManager2` session enumeration on the default render
+   endpoint; any `AudioSessionStateActive` session postpones **both** monitor-off and
+   sleep/hibernate - while media plays only the screen rules apply. Sessions whose display
+   name matches `--phantom-audio` are skipped. `--no-audio-awake` restores the old behaviour
+   (media postpones only the display-off).
 7. Pause agent: when the screens go dark the guard writes `pause` + process names to
    `pause-request.txt`; the `SleepGuardAgent` logon task (plain Windows PowerShell) suspends those
    processes and writes the real pids to `pause-state.txt`. The first real input makes the guard
@@ -242,7 +247,8 @@ matter if you are adapting this code:
 
 - Runs in the interactive desktop session only (that is where raw input and `SC_MONITORPOWER` live).
 - Some fullscreen-exclusive games ignore the monitor-off message. Sleep/hibernate still work.
-- Silent video (no audio stream) is **not** detected by the audio exception; only audio sessions.
+- Silent video (no audio stream) is **not** detected by the audio rule; only audio sessions count, so
+  a muted/silent video still lets the machine blank and sleep.
 - A remote-desktop tool can keep a render session `Active` with nothing audible — add its display
   name to `--phantom-audio` (`网易UU远程` is pre-configured).
 - `--pause-app` needs the `SleepGuardAgent` logon task (install.ps1 registers it). If the agent is

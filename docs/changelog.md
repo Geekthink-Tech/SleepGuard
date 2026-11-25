@@ -2,6 +2,25 @@
 
 时间均为 2026 年 10–11 月，机器为本仓库的开发机（Windows 11 build 26300，双显示器，水冷屏 HID，网易UU远程）。
 
+## v1.2.6 — 2026-11-25
+
+看视频/听歌时不再睡眠，只按屏幕规则处理（用户要求：“当我在看视频或者听歌的时候，不要进入睡眠，只管屏幕”）。
+
+- 语义反转：v1.0–v1.2.5 的规则是“正在播放音视频只推迟关屏，睡眠/休眠照常”；v1.2.6 改成
+  **播放期间同时推迟睡眠与休眠**，屏幕部分（`--display` 阈值、播放中推迟关屏）保持不变。
+- 实现：`SampleAudio()` 现在在 `displaySec > 0 || sleepSec > 0 || hibernateSec > 0` 时都运行
+  （原来只在开启关屏时采样）；OnTick 计算 `audioActive = WallMs() - lastAudioMs < AudioGraceMs`，
+  新增门禁 `audioSleepBlocked = audioKeepsAwake && audioActive`，命中时跳过 hibernate / sleep 分支，
+  每分钟最多记一行 `IDLE Ns >= sleep threshold Ms, but audio/video is playing -> sleep/hibernate
+  postponed (screen rules only)`。
+- 新增开关：`--no-audio-awake`（退回旧行为）、`--audio-keeps-awake`（默认，显式写回）、
+  `--test-audio`（自测：假装媒体一直在播放，无需真实播放器即可验证门禁）。
+- 启动日志增加 `audio-keeps-awake=True/False`，banner 升为 `ready v1.2.6`。
+- 验证：测试实例 `--display 0 --sleep 5 --test-audio` 运行 18 s → 出现 postponed 日志、**没有**
+  `requesting suspend`，证明阈值到点也不会睡；生产实例（v1.2.6，`-Display 300 -Sleep 600 -Hibernate 0`）
+  已重启并记录 `audio-keeps-awake=True`。
+- 注意：只能识别“真的有音频会话在渲染”的媒体；静音/无音轨视频不会被识别（见 README Limitations）。
+
 ## v1.2.5 — 2026-11-12
 
 - 修“从睡眠唤醒后守护又立刻请求睡眠”：guard 的空闲计时用墙钟，S3 期间时间继续走，所以用户按电源键

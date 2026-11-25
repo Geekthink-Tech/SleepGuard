@@ -22,6 +22,11 @@
 //                     WARNING: on some monitors (DisplayPort) DPMS off drops the
 //                     link, Windows then loses the display and nothing can wake it
 //                     again - the power button is needed. Off by default.
+//   --hibernate <sec> sleep-to-hibernate transition after N seconds of real idle
+//   --audio-keeps-awake  (v1.2.6, default ON) while audio/video is playing, postpone
+//                     sleep and hibernate - only the screen is managed
+//   --no-audio-awake  opt out: media playback no longer postpones sleep/hibernate
+//   --test-audio      SELF-TEST ONLY: pretend media is playing (verifies the gate)
 //   --once            log the resolved configuration and keep running (default)
 
 using System;
@@ -86,6 +91,12 @@ internal static class SleepGuard
     private const int PauseRetryMs = 15000;   // re-send a pause request the agent never confirmed
     private static bool audioWasPlaying;    // for start/stop transition logging
     private static bool audioDebug;         // --audio-debug: heartbeat + every sample in the log
+    // v1.2.6: the user watches video / listens to music and does not want the machine to
+    // fall asleep while media is playing - only the screen may be managed. So "audio is
+    // playing" now postpones sleep/hibernate as well (and, as before, the display-off).
+    private static bool audioKeepsAwake = true;   // --no-audio-awake disables this
+    private static long lastAudioSleepLogMs;      // rate-limits "sleep postponed by audio"
+    private static bool testAudio;                // --test-audio: pretend media is always playing (self-test)
     private static long lastHeartbeatMs;
     private static long nextSleepRetryMs;
     private static long nextDisplayRetryMs;  // re-send monitor-off if a phantom input turned it back on
@@ -514,10 +525,11 @@ internal static class SleepGuard
     }
 
     // ---- audio / video playback detection --------------------------------
-    // The user's rule: while audio/video is actually playing, POSTPONE only the
-    // display-off step. Falling asleep / hibernating still happens on schedule
-    // ("play audio and it must still sleep"). CoreAudio session enumeration tells us whether anything
-    // currently renders audio on the default playback endpoint.
+    // The user's rule (changed 2026-11-25): while audio/video is actually playing the
+    // machine must NOT fall asleep and must not hibernate - only the screen is managed.
+    // (Earlier the rule was the opposite: "audio only postpones the display-off, the PC
+    // must still sleep"; that is now inverted.) CoreAudio session enumeration tells us
+    // whether anything currently renders audio on the default playback endpoint.
     [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
     private class MMDeviceEnumeratorComObject { }
 
@@ -883,7 +895,11 @@ internal static class SleepGuard
         // Sample audio every second: a 1-second notification "ding" must not
         // postpone the display for the whole idle period, so the display branch
         // only looks at how recently real audio was playing.
-        if (displaySec > 0) SampleAudio();
+        // v1.2.6: sample whenever any threshold is active - media playback now also
+        // postpones sleep/hibernate, not just the display-off.
+        if (displaySec > 0 || sleepSec > 0 || hibernateSec > 0) SampleAudio();
+        if (testAudio) lastAudioMs = WallMs();   // --test-audio: deterministic media simulation
+        bool audioActive = WallMs() - lastAudioMs < AudioGraceMs;
 
         if (audioDebug && WallMs() - lastHeartbeatMs >= 30000)
         {
@@ -924,14 +940,27 @@ internal static class SleepGuard
                 "sleep/hibernate postponed: pause-app not confirmed (attempt {0}) - the screens are still on", pauseAttempts));
         }
 
-        if (!sleepBlocked && hibernateSec > 0 && idle >= hibernateSec && now >= nextSleepRetryMs)
+        // v1.2.6: while real audio/video keeps playing, do not sleep and do not hibernate.
+        // The screen keeps its own rules (display branch below), so playing media means
+        // "screen may still blank after the display threshold, machine stays up".
+        bool audioSleepBlocked = audioKeepsAwake && audioActive;
+        double mediaSleepThreshold = sleepSec > 0 ? sleepSec : hibernateSec;
+        if (audioSleepBlocked && idle >= mediaSleepThreshold && WallMs() - lastAudioSleepLogMs > 60000)
+        {
+            lastAudioSleepLogMs = WallMs();
+            Log(string.Format(CultureInfo.InvariantCulture,
+                "IDLE {0:F0}s >= sleep threshold {1}s, but audio/video is playing -> sleep/hibernate postponed (screen rules only)",
+                idle, mediaSleepThreshold));
+        }
+
+        if (!sleepBlocked && !audioSleepBlocked && hibernateSec > 0 && idle >= hibernateSec && now >= nextSleepRetryMs)
         {
             HibernateNow(string.Format(CultureInfo.InvariantCulture,
                 "IDLE {0:F0}s >= hibernate threshold {1}s", idle, hibernateSec));
             return;
         }
 
-        if (!sleepBlocked && sleepSec > 0 && idle >= sleepSec && now >= nextSleepRetryMs)
+        if (!sleepBlocked && !audioSleepBlocked && sleepSec > 0 && idle >= sleepSec && now >= nextSleepRetryMs)
         {
             // If the machine refuses to sleep (another power request is holding it
             // awake), fall through and at least turn the display off.
@@ -941,13 +970,14 @@ internal static class SleepGuard
         if (displaySec > 0 && idle >= displaySec && !displayOff)
         {
             // Exception requested by the user: keep the screen awake while
-            // audio/video is playing, but do NOT postpone sleep/hibernate.
-            if (WallMs() - lastAudioMs < AudioGraceMs)
+            // audio/video is playing. Sleep/hibernate are postponed as well (v1.2.6),
+            // handled by audioSleepBlocked above.
+            if (audioActive)
             {
                 if (!displayPostponed)
                 {
                     Log(string.Format(CultureInfo.InvariantCulture,
-                        "IDLE {0:F0}s >= display threshold {1}s, but audio/video is playing -> display-off postponed (sleep/hibernate still on schedule)",
+                        "IDLE {0:F0}s >= display threshold {1}s, but audio/video is playing -> display-off postponed (sleep/hibernate postponed too)",
                         idle, displaySec));
                     displayPostponed = true;
                 }
@@ -1381,6 +1411,16 @@ internal static class SleepGuard
                     logPath = v; i++; break;
                 case "--audio-debug":
                     audioDebug = true; break;
+                case "--no-audio-awake":
+                    // Opt out of v1.2.6: media playback would no longer postpone sleep/hibernate.
+                    audioKeepsAwake = false; break;
+                case "--audio-keeps-awake":
+                    audioKeepsAwake = true; break;
+                case "--test-audio":
+                    // Self-test only: behave as if media is playing forever, so the
+                    // "audio postpones sleep/hibernate" gate can be verified without
+                    // relying on a real player on this machine.
+                    testAudio = true; break;
                 case "--ddc":
                     ddcEnabled = true; break;
                 case "--pause-app":
@@ -1460,7 +1500,7 @@ internal static class SleepGuard
             string.Join(",", pauseApps) + "] log=" + logPath);
         Log("SeShutdownPrivilege enabled=" + EnableShutdownPrivilege());
         Log("SeDebugPrivilege enabled=" + EnableDebugPrivilege());
-        Log("monitor power control: ddc=" + ddcEnabled);
+        Log("monitor power control: ddc=" + ddcEnabled + " audio-keeps-awake=" + audioKeepsAwake);
         if (ddcEnabled) ApplyMonitorPower(true);   // a previous run may have died with the panels dark
 
         string className = "SleepGuardWindowClass";
@@ -1556,7 +1596,7 @@ internal static class SleepGuard
         lastAudioMs = WallMs();
         displayOff = false;
         ResumeIdleApps("startup, previous guard died while paused");
-        Log("ready v1.2.5 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled);
+        Log("ready v1.2.6 (console-subsystem build): raw input (mouse/keyboard/consumer/pen/touch) + cursor polling; hooks disabled; phantom devices ignored; pause-app=" + string.Join(",", pauseApps) + " confirmed+watchdog; ddc=" + ddcEnabled + " audio-keeps-awake=" + audioKeepsAwake);
 
         if (testPause)
         {
